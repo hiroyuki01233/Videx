@@ -269,5 +269,104 @@ int main(int argc, char** argv) {
     expect(textEvents.size() == eventsBeforeClick,
            "clicking text without moving must not commit a move");
 
+    // applyStillAdjustments bakes time-invariant masks and effects into a title
+    // raster so an affected title keeps playing on the native-resolution
+    // overlay path. These checks pin the behaviour the overlay path depends on.
+    {
+        using videx::render::applyStillAdjustments;
+        using videx::render::MonitorEffects;
+        using videx::render::MonitorMask;
+
+        QImage still(64, 64, QImage::Format_ARGB32);
+        still.fill(QColor(120, 130, 140, 255));
+
+        // No mask and no effects must hand the image back untouched, so the
+        // common case costs nothing.
+        const QImage identity = applyStillAdjustments(still, MonitorMask{}, MonitorEffects{});
+        expect(identity.size() == still.size(), "identity adjust must keep the size");
+        expect(identity.pixel(32, 32) == still.pixel(32, 32),
+               "identity adjust must not change pixels");
+
+        // A rectangle mask covering the middle half must clear the outside and
+        // leave the inside alone.
+        MonitorMask centreHalf;
+        centreHalf.shape = 1;
+        centreHalf.width = 0.5;
+        centreHalf.height = 0.5;
+        const QImage masked = applyStillAdjustments(still, centreHalf, MonitorEffects{});
+        expect(qAlpha(masked.pixel(32, 32)) == 255, "mask must keep the covered centre");
+        expect(qAlpha(masked.pixel(2, 2)) == 0, "mask must clear outside the rectangle");
+
+        // Inverting must swap which side survives.
+        MonitorMask inverted = centreHalf;
+        inverted.inverted = true;
+        const QImage invertedImage = applyStillAdjustments(still, inverted, MonitorEffects{});
+        expect(qAlpha(invertedImage.pixel(32, 32)) == 0,
+               "inverted mask must clear the centre");
+        expect(qAlpha(invertedImage.pixel(2, 2)) == 255,
+               "inverted mask must keep the outside");
+
+        // Positive brightness must lift the channels without touching alpha.
+        MonitorEffects brighter;
+        brighter.brightness = 0.25;
+        const QImage brightened = applyStillAdjustments(still, MonitorMask{}, brighter);
+        expect(qRed(brightened.pixel(32, 32)) > qRed(still.pixel(32, 32)),
+               "brightness must raise the red channel");
+        expect(qAlpha(brightened.pixel(32, 32)) == 255,
+               "brightness must preserve alpha");
+
+        // Fully desaturating must equalize the channels.
+        MonitorEffects grey;
+        grey.saturation = -1.0;
+        const QImage greyed = applyStillAdjustments(still, MonitorMask{}, grey);
+        const QRgb greyPixel = greyed.pixel(32, 32);
+        expect(std::abs(qRed(greyPixel) - qGreen(greyPixel)) <= 1 &&
+                   std::abs(qGreen(greyPixel) - qBlue(greyPixel)) <= 1,
+               "saturation -1 must collapse the channels to grey");
+
+        // Order regression: the mask must run before the colour maths, matching
+        // ensureComposedFrame. On a feathered edge the mask factor is partial
+        // and contrast pivots about 0.5, so the two orders disagree sharply.
+        //
+        // Masking first darkens the pixel and *then* pushes it away from mid
+        // grey, driving it far down. Adjusting first and masking after would
+        // instead leave the edge at roughly (adjusted centre x mask factor).
+        // Asserting only "edge darker than centre" does not discriminate --
+        // both orders satisfy that -- so compare against that proportional
+        // value, which only the wrong order lands on.
+        MonitorMask feathered;
+        feathered.shape = 2;
+        feathered.width = 0.5;
+        feathered.height = 0.5;
+        feathered.feather = 0.25;
+        MonitorEffects contrasted;
+        contrasted.contrast = 0.8;
+        const QImage featheredImage =
+            applyStillAdjustments(still, feathered, contrasted);
+        const QRgb centrePixel = featheredImage.pixel(32, 32);
+        // Sample the middle of the feather band, where the mask factor is
+        // around 0.5. Points further out have a factor near zero, and there
+        // both orders round down to roughly the same value, so the comparison
+        // below would not discriminate between them.
+        const QRgb edgePixel = featheredImage.pixel(32, 16);
+        expect(qAlpha(centrePixel) == 255,
+               "feathered mask must leave the centre fully opaque");
+        expect(qAlpha(edgePixel) > 90 && qAlpha(edgePixel) < 180,
+               "the sampled edge pixel must sit mid-way through the feather so "
+               "the ordering comparison is meaningful");
+        // The mask changes coverage, not colour. The result is premultiplied, so
+        // a feathered pixel must land at (centre colour x its own alpha). If the
+        // mask also scaled colour, premultiplying on the way out would apply the
+        // factor twice and the edge would sit near centre x factor squared --
+        // visibly too dark, and out of step with the compositor.
+        const double edgeFactor = qAlpha(edgePixel) / 255.0;
+        const double expectedRed = qRed(centrePixel) * edgeFactor;
+        const double doubleDarkenedRed = expectedRed * edgeFactor;
+        expect(std::abs(qRed(edgePixel) - expectedRed) <= 2.0,
+               "a feathered edge must be premultiplied centre colour x alpha");
+        expect(std::abs(qRed(edgePixel) - doubleDarkenedRed) > 2.0,
+               "a feathered edge must not have the mask factor applied twice");
+    }
+
     return failures == 0 ? 0 : 1;
 }

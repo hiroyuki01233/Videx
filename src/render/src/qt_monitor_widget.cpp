@@ -1192,25 +1192,29 @@ QImage applyStillAdjustments(const QImage& source, const MonitorMask& mask,
     QImage result = source.convertToFormat(QImage::Format_ARGB32);
     const double halfWidth = std::max(1.0, result.width() * 0.5);
     const double halfHeight = std::max(1.0, result.height() * 0.5);
+    // This pass works in straight (non-premultiplied) ARGB32, so the mask must
+    // scale alpha only. ensureComposedFrame() scales all four channels because
+    // it masks in premultiplied space, where that is the same operation. Scaling
+    // colour here as well would apply the factor a second time when the result
+    // is premultiplied on the way out, darkening feathered edges by the square
+    // of the mask factor.
     for (int row = 0; row < result.height(); ++row) {
         auto* pixels = reinterpret_cast<QRgb*>(result.scanLine(row));
         for (int column = 0; column < result.width(); ++column) {
-            if (hasColor) {
-                pixels[column] = adjustPixel(
-                    pixels[column], effects.brightness, effects.contrast, effects.saturation,
-                    effects.vignette, (column - halfWidth) / halfWidth,
-                    (row - halfHeight) / halfHeight);
-            }
             if (hasMask) {
                 const double factor = maskFactorAt(
                     mask.shape, mask.centerX, mask.centerY, std::max(mask.width, 0.001),
                     std::max(mask.height, 0.001), mask.feather, mask.inverted,
                     (column + 0.5) / result.width(), (row + 0.5) / result.height());
                 const QRgb pixel = pixels[column];
-                pixels[column] = qRgba(static_cast<int>(qRed(pixel) * factor),
-                                       static_cast<int>(qGreen(pixel) * factor),
-                                       static_cast<int>(qBlue(pixel) * factor),
+                pixels[column] = qRgba(qRed(pixel), qGreen(pixel), qBlue(pixel),
                                        static_cast<int>(qAlpha(pixel) * factor));
+            }
+            if (hasColor) {
+                pixels[column] = adjustPixel(
+                    pixels[column], effects.brightness, effects.contrast, effects.saturation,
+                    effects.vignette, (column - halfWidth) / halfWidth,
+                    (row - halfHeight) / halfHeight);
             }
         }
     }
