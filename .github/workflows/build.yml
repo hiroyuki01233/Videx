@@ -1,0 +1,82 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows MSVC
+            os: windows-latest
+            qt_arch: win64_msvc2022_64
+            configure_preset: ci-windows
+            vcpkg_root: C:/vcpkg
+          - name: macOS Apple Clang
+            os: macos-latest
+            qt_arch: clang_64
+            configure_preset: ci-macos
+            vcpkg_root: /usr/local/share/vcpkg
+
+    runs-on: ${{ matrix.os }}
+    env:
+      VCPKG_ROOT: ${{ matrix.vcpkg_root }}
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/.cache/vcpkg,readwrite
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: 6.8.3
+          arch: ${{ matrix.qt_arch }}
+          modules: qtmultimedia
+          cache: true
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: .cache/vcpkg
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+
+      - name: Configure
+        run: cmake --preset ${{ matrix.configure_preset }}
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.configure_preset }} --parallel
+
+      - name: Test
+        run: ctest --preset ${{ matrix.configure_preset }}
+
+      - name: Smoke test Windows editor
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $videxProcess = Start-Process "build/ci-windows/bin/Release/Videx.exe" -PassThru
+          Start-Sleep -Seconds 5
+          $videxProcess.Refresh()
+          if ($videxProcess.HasExited) {
+            throw "Videx exited during startup with code $($videxProcess.ExitCode)"
+          }
+          Stop-Process -Id $videxProcess.Id
+
+      - name: Smoke test macOS editor bundle
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          ./build/ci-macos/bin/Videx.app/Contents/MacOS/Videx &
+          videx_pid=$!
+          sleep 5
+          kill -0 "$videx_pid"
+          kill "$videx_pid"
+          wait "$videx_pid" || true

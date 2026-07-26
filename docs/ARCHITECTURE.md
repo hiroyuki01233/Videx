@@ -8,14 +8,14 @@ a collection of network services.
 ```text
 +---------------- Desktop application ----------------+
 |                                                     |
-|  TypeScript UI                                      |
-|  panels / timeline canvas / keyboard / accessibility|
+|  Qt 6 UI                                            |
+|  widgets / timeline / keyboard / accessibility      |
 |                 | typed messages                    |
-|  Rust application core                             |
+|  C++ application core                              |
 |  project / commands / undo / jobs / persistence     |
 |       |                 |                |           |
 |  native preview   media worker(s)      AI adapter   |
-|  wgpu surface     decode/render/export  local/cloud  |
+|  QRhi surface     decode/render/export  local/cloud  |
 |       +--------- shared frames/handles --+           |
 +-----------------------------------------------------+
           |                |
@@ -30,17 +30,20 @@ state.
 
 ### UI
 
-The UI owns transient presentation state: selection, hover, panel layout, zoom,
-and drag previews. It renders the timeline as a virtualized canvas rather than a
-large DOM tree. It does not own the authoritative project.
+The UI uses Qt Widgets for windows, panels, docking, menus, input, and
+accessibility. Timeline and monitor surfaces use custom Qt widgets with
+accelerated rendering where measurement justifies it. The UI owns transient
+presentation state: selection, hover, panel layout, zoom, and drag previews. It
+does not own the authoritative project.
 
 While dragging, the UI can render an optimistic preview. On commit it sends one
 domain command and reconciles with the resulting project revision.
 
 ### Application core
 
-The core is the single writer for project state. Its API is a small set of typed
-queries and commands. Responsibilities include:
+The core is a platform-neutral C++ library and the single writer for project
+state. Qt, FFmpeg, and operating-system types do not appear in its public API.
+Its API is a small set of typed queries and commands. Responsibilities include:
 
 - validating commands against the current project revision;
 - applying atomic transactions and generating inverse operations;
@@ -52,9 +55,11 @@ queries and commands. Responsibilities include:
 ### Media engine
 
 The media engine uses FFmpeg libraries for demux, decode, encode, resampling, and
-format conversion. A separate render graph describes compositing and effects.
-GPU effects and preview composition are implemented behind a wgpu abstraction;
-CPU fallbacks remain possible for correctness and testability.
+format conversion. Media work executes in isolated C++ worker processes. A
+separate Videx render graph describes compositing and effects. The initial GPU
+implementation uses Qt's Rendering Hardware Interface through a narrow
+`RenderBackend`; Direct3D and Metal details remain in platform adapters. CPU
+fallbacks remain possible for correctness and testability.
 
 The first engine has four schedulers:
 
@@ -70,6 +75,20 @@ AI receives a bounded project view and returns a proposed command transaction.
 It has no filesystem path, raw SQL, project-file write, or media-delete tool.
 More detail is in ADR 0002.
 
+### Platform adapters
+
+The shared libraries depend on capability interfaces rather than operating
+system names. Initial implementations include:
+
+- Windows: WASAPI audio, D3D11/D3D12 surfaces and hardware frames, native file
+  integration, power/session events, and signing/packaging;
+- macOS: CoreAudio, VideoToolbox and Metal surfaces, security-scoped file access,
+  power/session events, notarization, and universal packaging.
+
+The main executable selects these adapters at compile time. Platform files stay
+under `src/platform/windows` and `src/platform/macos`; they do not fork the
+project model or editor behavior.
+
 ## Project data model
 
 The authoritative model is an edit decision graph, not a list of UI rectangles.
@@ -81,7 +100,7 @@ Project
 ├── sequences[]
 │   ├── settings    rational frame rate, dimensions, audio layout
 │   ├── tracks[]    kind, order, lock/mute/visibility
-│   │   └── items[] clip | gap | transition | nested-sequence
+│   │   └── items[] clip | transition | nested-sequence
 │   └── markers[]
 ├── transcripts[]  time-ranged words linked to asset streams
 └── metadata        schema version, app version, creation data
@@ -91,9 +110,10 @@ Each clip stores a timeline range, a source range, playback rate, asset stream
 reference, and ordered effect parameters. Time is represented by integer ticks
 with an explicit rational rate; floating-point seconds are never persisted.
 
-Track-item ordering and overlap rules are invariants enforced by the core. A UI
-gesture such as ripple trim may expand into several low-level operations, but it
-is committed as one transaction.
+Empty time on a track is implicit rather than stored as gap objects. OTIO gaps
+are materialized during interchange. Track-item ordering and overlap rules are
+invariants enforced by the core. A UI gesture such as ripple trim may expand
+into several low-level operations, but it is committed as one transaction.
 
 ## Commands and history
 

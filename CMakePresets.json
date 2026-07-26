@@ -1,0 +1,150 @@
+{
+  "version": 8,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 28,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "BUILD_TESTING": "ON",
+        "VIDEX_BUILD_APP": "ON",
+        "VIDEX_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
+      "name": "windows-msvc",
+      "displayName": "Windows MSVC",
+      "inherits": "base",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64"
+    },
+    {
+      "name": "windows-core",
+      "displayName": "Windows core only",
+      "inherits": "windows-msvc",
+      "cacheVariables": {
+        "VIDEX_BUILD_APP": "OFF"
+      }
+    },
+    {
+      "name": "macos-clang",
+      "displayName": "macOS Apple Clang",
+      "inherits": "base",
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "macos-media",
+      "displayName": "macOS full editor",
+      "inherits": "macos-clang",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_INSTALLED_DIR": "${sourceDir}/.deps/vcpkg_installed",
+        "VIDEX_BUILD_MEDIA_WORKER": "ON",
+        "VIDEX_REQUIRE_QT": "ON"
+      }
+    },
+    {
+      "name": "ci-windows",
+      "hidden": true,
+      "inherits": "windows-msvc",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_INSTALLED_DIR": "${sourceDir}/.deps/vcpkg_installed",
+        "VIDEX_BUILD_MEDIA_WORKER": "ON",
+        "VIDEX_REQUIRE_QT": "ON"
+      }
+    },
+    {
+      "name": "ci-macos",
+      "hidden": true,
+      "inherits": "macos-media",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-msvc",
+      "configurePreset": "windows-msvc",
+      "configuration": "Debug"
+    },
+    {
+      "name": "windows-core",
+      "configurePreset": "windows-core",
+      "configuration": "Debug"
+    },
+    {
+      "name": "macos-clang",
+      "configurePreset": "macos-clang"
+    },
+    {
+      "name": "macos-media",
+      "configurePreset": "macos-media"
+    },
+    {
+      "name": "ci-windows",
+      "configurePreset": "ci-windows",
+      "configuration": "Release"
+    },
+    {
+      "name": "ci-macos",
+      "configurePreset": "ci-macos"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "windows-msvc",
+      "configurePreset": "windows-msvc",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "windows-core",
+      "configurePreset": "windows-core",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "macos-clang",
+      "configurePreset": "macos-clang",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "macos-media",
+      "configurePreset": "macos-media",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "ci-windows",
+      "configurePreset": "ci-windows",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "ci-macos",
+      "configurePreset": "ci-macos",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

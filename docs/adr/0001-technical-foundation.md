@@ -1,6 +1,6 @@
 # ADR 0001: Technical foundation
 
-- Status: Proposed; validate during weeks 1–2
+- Status: Superseded by ADR 0004
 - Date: 2026-07-18
 
 ## Context

@@ -3,20 +3,23 @@
 The objective is evidence that the architecture can support a professional-feel
 editor, not a long feature checklist.
 
-## Weeks 1–2: risk spikes
+## Weeks 1–2: foundation and risk spikes
 
-- Decide the reference machine and publish repeatable benchmarks.
-- Prototype a Tauri/web timeline canvas with 10,000 items, snapping, zooming, and
+- Establish CMake presets, C++ formatting/static analysis, unit tests, and CI on
+  Windows and macOS.
+- Decide the reference machines and publish repeatable benchmarks.
+- Prototype a Qt timeline widget with 10,000 items, snapping, zooming, and
   keyboard-driven selection.
-- Prototype a native wgpu preview surface hosted beside the web UI on Windows,
-  macOS, and Linux; verify resize, HiDPI, fullscreen, and GPU-device loss.
+- Prototype a QRhi monitor surface using Direct3D on Windows and Metal on macOS;
+  verify resize, HiDPI, fullscreen, and GPU-device loss.
 - Decode H.264 and ProRes samples through an isolated FFmpeg worker and transfer
   frames without copying full pixels through JSON/IPC.
 - Build a 48 kHz audio callback and prove seek/play/pause synchronization.
 
-Exit criterion: measured results choose the desktop shell and frame-transfer
-mechanism. If native preview integration is fragile, evaluate bundled Chromium
-or a fully native shell before building product UI.
+Exit criterion: the same source tree builds and runs on both systems, and
+measured results choose the GPU-frame-transfer and audio-clock mechanisms. QRhi
+is replaceable behind `RenderBackend` if its compatibility or performance is
+insufficient.
 
 ## Weeks 3–5: deterministic editing core
 

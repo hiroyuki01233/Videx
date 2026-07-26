@@ -1,0 +1,32 @@
+# CMake and build products
+/build/
+/out/
+/cmake-build-*/
+/.deps/
+/.tools/
+/vcpkg_installed/
+CMakeUserPresets.json
+CMakeFiles/
+CMakeCache.txt
+Testing/
+aqtinstall.log
+
+# Third-party analysis tooling kept beside the project for local debugging
+# (Ghidra, Wireshark, dnSpy, DrMemory, API Monitor). ~9.6 GB across ~12,700
+# files, none of it Videx source. Keep it out of history; if it needs to be
+# shared, use a separate repository or Git LFS rather than this one.
+/Tools/
+
+# IDE and operating-system files
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.VC.db
+.DS_Store
+Thumbs.db
+
+# Generated application data
+*.videx/cache/
+*.videx/cache-index.sqlite*
