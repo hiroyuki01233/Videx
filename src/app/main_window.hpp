@@ -34,6 +34,7 @@ class QLabel;
 class QLineEdit;
 class QListWidget;
 class QListWidgetItem;
+class QMenu;
 class QPlainTextEdit;
 class QPushButton;
 class QProcess;
@@ -41,6 +42,7 @@ class QProgressDialog;
 class QProgressBar;
 class QMediaPlayer;
 class QSlider;
+class QSplitter;
 class QString;
 class QTabWidget;
 class QTimer;
@@ -55,6 +57,9 @@ struct MonitorTitleOverlay;
 
 namespace videx::ui {
 
+class ContextRail;
+class PropertySection;
+class SelectionModel;
 class TimelineWidget;
 
 // Why the program monitor is (or is not) using the direct-overlay fast path.
@@ -171,9 +176,11 @@ class MainWindow final : public QMainWindow {
     void applyTextPanel();
     void saveWorkspaceState();
     void restoreWorkspaceState();
+    void applyWorkspacePreset(int preset);
     void ensureMediaPlayer();
     void loadWaveformCache(const ProjectAsset& asset);
     void updateInspector(core::ClipId clipId);
+    void updateSelectionContext(const std::vector<core::ClipId>& clipIds);
     void applyInspectorProperties();
     void slipSelected(core::Frame sourceDelta);
     void rollSelected(core::Frame cutDelta);
@@ -195,6 +202,16 @@ class MainWindow final : public QMainWindow {
     void insertSourceSelection(bool overwrite);
 
     core::EditSession editSession_;
+    SelectionModel* selectionModel_ = nullptr;
+    ContextRail* contextRail_ = nullptr;
+    PropertySection* compositingSection_ = nullptr;
+    PropertySection* audioSection_ = nullptr;
+    PropertySection* timingSection_ = nullptr;
+    PropertySection* transformSection_ = nullptr;
+    PropertySection* cropMaskSection_ = nullptr;
+    PropertySection* effectsSection_ = nullptr;
+    PropertySection* addEffectSection_ = nullptr;
+    PropertySection* textSection_ = nullptr;
     TimelineWidget* timeline_ = nullptr;
     QTreeWidget* projectTree_ = nullptr;
     QLineEdit* projectSearch_ = nullptr;
@@ -258,6 +275,7 @@ class MainWindow final : public QMainWindow {
     QAction* undoAction_ = nullptr;
     QAction* redoAction_ = nullptr;
     QAction* transportAction_ = nullptr;
+    QMenu* windowMenu_ = nullptr;
     QToolButton* playPauseButton_ = nullptr;
     QSlider* seekSlider_ = nullptr;
     QSlider* sourceSeekSlider_ = nullptr;
@@ -292,6 +310,7 @@ class MainWindow final : public QMainWindow {
     QDoubleSpinBox* maskHeightSpin_ = nullptr;
     QDoubleSpinBox* maskFeatherSpin_ = nullptr;
     QCheckBox* maskInvertedCheck_ = nullptr;
+    QWidget* inspectorEditSource_ = nullptr;
     QListWidget* effectsList_ = nullptr;
     QListWidget* historyList_ = nullptr;
     QProgressBar* leftAudioMeter_ = nullptr;
@@ -300,6 +319,8 @@ class MainWindow final : public QMainWindow {
     QComboBox* effectInterpolationCombo_ = nullptr;
     QDoubleSpinBox* effectAmountSpin_ = nullptr;
     QCheckBox* effectEnabledCheck_ = nullptr;
+    core::ClipId effectsPanelClip_;
+    QByteArray effectsPanelSignature_;
     core::ClipId inspectedClip_;
     core::TrackId videoTrack_;
     core::TrackId audioTrack_;
@@ -335,7 +356,7 @@ class MainWindow final : public QMainWindow {
     core::Frame playbackClockFrame_ = 0;
     bool loopPlayback_ = false;
     int playbackResolutionDivisor_ = 0;
-    QTabWidget* monitorTabs_ = nullptr;
+    QSplitter* monitorSplitter_ = nullptr;
     bool monitorFullscreen_ = false;
     QLineEdit* effectsBrowserSearch_ = nullptr;
     QListWidget* effectsBrowserList_ = nullptr;

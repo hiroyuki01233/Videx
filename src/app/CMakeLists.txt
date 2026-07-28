@@ -7,12 +7,34 @@ qt_add_executable(
     main.cpp
     main_window.cpp
     main_window.hpp
+    context_rail.cpp
+    context_rail.hpp
+    effect_card.cpp
+    effect_card.hpp
+    property_section.cpp
+    property_section.hpp
+    property_row.cpp
+    property_row.hpp
     project_file.cpp
     project_file.hpp
+    selection_model.cpp
+    selection_model.hpp
+    theme.cpp
+    theme.hpp
+    theme_tokens.hpp
     timeline_widget.cpp
     timeline_widget.hpp
     title_store.cpp
     title_store.hpp
+)
+
+qt_add_resources(
+    videx
+    "videx_theme"
+    PREFIX
+        "/"
+    FILES
+        resources/theme/videx-dark.qss
 )
 
 target_link_libraries(videx PRIVATE Videx::Core Videx::RenderQt Qt6::Multimedia Qt6::Widgets)

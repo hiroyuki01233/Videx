@@ -1,4 +1,5 @@
 #include "main_window.hpp"
+#include "theme.hpp"
 
 #include <videx/core/application_info.hpp>
 
@@ -8,6 +9,9 @@
 
 int main(int argc, char* argv[]) {
     QApplication application(argc, argv);
+    application.setStyle(QStringLiteral("Fusion"));
+    application.setPalette(videx::ui::darkPalette());
+    application.setStyleSheet(videx::ui::applicationStyleSheet());
 
     QCoreApplication::setApplicationName(
         QString::fromUtf8(videx::core::ApplicationInfo::name().data()));

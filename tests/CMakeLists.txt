@@ -106,6 +106,36 @@ if(Qt6_FOUND)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
     endif()
 
+    add_executable(
+        videx_context_rail_tests
+        app/context_rail_test.cpp
+        ../src/app/context_rail.cpp
+        ../src/app/context_rail.hpp
+        ../src/app/effect_card.cpp
+        ../src/app/effect_card.hpp
+        ../src/app/property_section.cpp
+        ../src/app/property_section.hpp
+        ../src/app/property_row.cpp
+        ../src/app/property_row.hpp
+        ../src/app/selection_model.cpp
+        ../src/app/selection_model.hpp
+    )
+    target_include_directories(videx_context_rail_tests PRIVATE ../src/app)
+    target_link_libraries(videx_context_rail_tests PRIVATE Videx::Core Qt6::Widgets)
+    target_compile_features(videx_context_rail_tests PRIVATE cxx_std_20)
+    set_target_properties(videx_context_rail_tests PROPERTIES AUTOMOC ON)
+    videx_set_project_warnings(videx_context_rail_tests)
+    videx_enable_sanitizers(videx_context_rail_tests)
+    videx_isolate_test_runtime(videx_context_rail_tests)
+    add_test(NAME videx.ui.context_rail COMMAND videx_context_rail_tests)
+    set_tests_properties(videx.ui.context_rail PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+    if(WIN32)
+        set_tests_properties(videx.ui.context_rail PROPERTIES
+            ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+    endif()
+
     if(TARGET videx_media_worker)
         add_executable(videx_media_worker_protocol_tests app/media_worker_protocol_test.cpp)
         target_link_libraries(videx_media_worker_protocol_tests PRIVATE Qt6::Core)

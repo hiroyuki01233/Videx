@@ -1,4 +1,5 @@
 #include "timeline_widget.hpp"
+#include "theme_tokens.hpp"
 
 #include <QColor>
 #include <QDragEnterEvent>
@@ -2065,11 +2066,11 @@ void TimelineWidget::paintEvent(QPaintEvent* event) {
     updateHorizontalScrollBar();
     updateVerticalScrollBar();
     QPainter painter(this);
-    painter.fillRect(rect(), QColor(31, 34, 39));
+    painter.fillRect(rect(), theme::surfaceTimeline);
     painter.setRenderHint(QPainter::Antialiasing, false);
 
-    painter.fillRect(QRect(0, 0, width(), rulerHeight), QColor(24, 26, 30));
-    painter.setPen(QColor(115, 121, 132));
+    painter.fillRect(QRect(0, 0, width(), rulerHeight), theme::surfaceBase);
+    painter.setPen(theme::textSecondary);
 
     const int frameStep = std::max(1, static_cast<int>(std::ceil(48.0 / pixelsPerFrame_)));
     const core::Frame visibleFrames =
@@ -2082,7 +2083,7 @@ void TimelineWidget::paintEvent(QPaintEvent* event) {
     }
 
     if (!snapEnabled_) {
-        painter.setPen(QColor(255, 190, 90));
+        painter.setPen(theme::warning);
         painter.drawText(QRect(trackLabelWidth + 4, 0, 120, rulerHeight),
                          Qt::AlignVCenter | Qt::AlignLeft, tr("Snap off (S)"));
     }
@@ -2091,11 +2092,10 @@ void TimelineWidget::paintEvent(QPaintEvent* event) {
         const double cacheRight = frameToX(previewCacheStart_ + previewCacheDuration_);
         painter.fillRect(QRectF(cacheLeft, rulerHeight - 3.0,
                                 std::max(1.0, cacheRight - cacheLeft), 3.0),
-                         previewCacheValid_ ? QColor(90, 200, 120)
-                                            : QColor(190, 80, 70));
+                         previewCacheValid_ ? theme::success : theme::error);
     }
 
-    painter.fillRect(QRect(0, 0, trackLabelWidth, height()), QColor(37, 40, 46));
+    painter.fillRect(QRect(0, 0, trackLabelWidth, height()), theme::surfacePanel);
     if (sequence_ == nullptr) {
         painter.drawText(rect(), Qt::AlignCenter, tr("No sequence open"));
         return;
@@ -2114,11 +2114,11 @@ void TimelineWidget::paintEvent(QPaintEvent* event) {
         }
         const QRect trackRect(0, top, width(), rowH);
         painter.fillRect(trackRect,
-                         row % 2U == 0U ? QColor(39, 42, 48) : QColor(35, 38, 44));
-        painter.setPen(QColor(54, 58, 66));
+                         row % 2U == 0U ? theme::surfaceTrackA : theme::surfaceTrackB);
+        painter.setPen(theme::border);
         painter.drawLine(0, top + rowH - 1, width(), top + rowH - 1);
 
-        painter.setPen(QColor(199, 204, 212));
+        painter.setPen(theme::textPrimary);
         // Kind-relative numbering: V1 is the first video track in the array
         // (the back layer), A1 the first audio track.
         int kindNumber = 0;
@@ -2147,11 +2147,11 @@ void TimelineWidget::paintEvent(QPaintEvent* event) {
         const bool targeted = track.kind == core::TrackKind::Video
                                   ? track.id == targetedVideoTrack_
                                   : track.id == targetedAudioTrack_;
-        painter.fillRect(targetButton, targeted ? QColor(50, 138, 190)
-                                                : QColor(55, 59, 67));
-        painter.fillRect(syncButton, track.syncLocked ? QColor(91, 155, 213)
-                                                       : QColor(55, 59, 67));
-        painter.setPen(QColor(225, 228, 234));
+        painter.fillRect(targetButton, targeted ? theme::accentSoft
+                                                : theme::surfaceRaised);
+        painter.fillRect(syncButton, track.syncLocked ? theme::accent
+                                                       : theme::surfaceRaised);
+        painter.setPen(theme::textPrimary);
         painter.drawText(lockButton, Qt::AlignCenter, QStringLiteral("L"));
         painter.drawText(stateButton, Qt::AlignCenter,
                          track.kind == core::TrackKind::Audio ? QStringLiteral("M")
@@ -2502,9 +2502,9 @@ void TimelineWidget::paintEvent(QPaintEvent* event) {
         painter.save();
         painter.setClipRect(QRect(trackLabelWidth, 0,
                                   std::max(0, width() - trackLabelWidth), height()));
-        painter.setPen(QPen(QColor(246, 77, 77), 1.0));
+        painter.setPen(QPen(theme::playhead, 1.0));
         painter.drawLine(playheadX, 0, playheadX, height());
-        painter.setBrush(QColor(246, 77, 77));
+        painter.setBrush(theme::playhead);
         painter.drawPolygon(QPolygon{{playheadX - 5, 0}, {playheadX + 5, 0},
                                      {playheadX, rulerHeight / 2}});
         painter.restore();

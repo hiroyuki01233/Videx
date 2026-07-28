@@ -1,4 +1,9 @@
 #include "main_window.hpp"
+#include "context_rail.hpp"
+#include "effect_card.hpp"
+#include "property_row.hpp"
+#include "property_section.hpp"
+#include "selection_model.hpp"
 #include "timeline_widget.hpp"
 #include "title_store.hpp"
 
@@ -61,6 +66,7 @@
 #include <QProcess>
 #include <QPainter>
 #include <QFont>
+#include <QFontDatabase>
 #include <QFontMetricsF>
 #include <QGuiApplication>
 #include <QScreen>
@@ -164,6 +170,14 @@ class KeyframeLaneWidget final : public QWidget {
             selectedIndex_ = -1;
         }
         setMinimumHeight(static_cast<int>(lanes_.size()) * laneHeight + 22);
+        update();
+    }
+
+    void setPlayhead(const videx::core::Frame playhead) {
+        if (playhead_ == playhead) {
+            return;
+        }
+        playhead_ = playhead;
         update();
     }
 
@@ -1132,6 +1146,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     setDockNestingEnabled(true);
     setAcceptDrops(true);
 
+    selectionModel_ = new SelectionModel(this);
     createActions();
     createPanels();
     createStatusBar();
@@ -1265,12 +1280,6 @@ void MainWindow::createActions() {
     addTransportShortcut(tr("Fullscreen Program Monitor (Ctrl+`)"),
                          QKeySequence(Qt::ControlModifier | Qt::Key_QuoteLeft),
                          [this] { toggleMonitorFullscreen(); });
-    addTransportShortcut(tr("Reset Workspace"), QKeySequence(), [this] {
-        if (!defaultWorkspaceState_.isEmpty()) {
-            restoreState(defaultWorkspaceState_);
-            statusBar()->showMessage(tr("Workspace layout reset to default"), 3000);
-        }
-    });
     addTransportShortcut(tr("Render In to Out"), QKeySequence(QStringLiteral("Ctrl+R")),
                          [this] {
                              if (sequenceInFrame_ < 0 ||
@@ -1530,7 +1539,28 @@ void MainWindow::createActions() {
             updateCaptionOverlay(frame);
         }
     });
-    menuBar()->addMenu(tr("&Window"));
+    windowMenu_ = menuBar()->addMenu(tr("&Window"));
+    auto* editWorkspace = windowMenu_->addAction(tr("Editing Workspace"));
+    auto* effectsWorkspace = windowMenu_->addAction(tr("Effects Workspace"));
+    auto* textWorkspace = windowMenu_->addAction(tr("Text Workspace"));
+    auto* audioWorkspace = windowMenu_->addAction(tr("Audio Workspace"));
+    connect(editWorkspace, &QAction::triggered, this,
+            [this] { applyWorkspacePreset(0); });
+    connect(effectsWorkspace, &QAction::triggered, this,
+            [this] { applyWorkspacePreset(1); });
+    connect(textWorkspace, &QAction::triggered, this,
+            [this] { applyWorkspacePreset(2); });
+    connect(audioWorkspace, &QAction::triggered, this,
+            [this] { applyWorkspacePreset(3); });
+    windowMenu_->addSeparator();
+    auto* resetWorkspace = windowMenu_->addAction(tr("Reset Workspace"));
+    connect(resetWorkspace, &QAction::triggered, this, [this] {
+        if (!defaultWorkspaceState_.isEmpty()) {
+            restoreState(defaultWorkspaceState_);
+            statusBar()->showMessage(tr("Workspace layout reset to default"), 3000);
+        }
+    });
+    windowMenu_->addSeparator();
     auto* helpMenu = menuBar()->addMenu(tr("&Help"));
     auto* diagnosticsAction = helpMenu->addAction(tr("Diagnostics..."));
     connect(diagnosticsAction, &QAction::triggered, this, [this] {
@@ -1624,12 +1654,16 @@ void MainWindow::createPanels() {
     centralLayout->setContentsMargins(0, 0, 0, 0);
     centralLayout->setSpacing(4);
 
-    monitorTabs_ = new QTabWidget;
     sourceMonitor_ = new render::QtMonitorWidget(tr("Source Monitor"));
     programMonitor_ = new render::QtMonitorWidget(tr("Program Monitor"));
-    monitorTabs_->addTab(programMonitor_, tr("Program"));
-    monitorTabs_->addTab(sourceMonitor_, tr("Source"));
-    monitorTabs_->setCurrentWidget(programMonitor_);
+    monitorSplitter_ = new QSplitter(Qt::Horizontal, centralContainer);
+    monitorSplitter_->setObjectName(QStringLiteral("MonitorSplitter"));
+    monitorSplitter_->setChildrenCollapsible(false);
+    monitorSplitter_->addWidget(sourceMonitor_);
+    monitorSplitter_->addWidget(programMonitor_);
+    monitorSplitter_->setStretchFactor(0, 1);
+    monitorSplitter_->setStretchFactor(1, 1);
+    monitorSplitter_->setSizes({600, 840});
     // Header button (and only it) requests fullscreen; the shortcut path is
     // Ctrl+` / Ctrl+Shift+F.
     programMonitor_->setFullscreenRequestHandler(
@@ -1639,7 +1673,7 @@ void MainWindow::createPanels() {
             toggleMonitorFullscreen();
         }
     });
-    centralLayout->addWidget(monitorTabs_, 1);
+    centralLayout->addWidget(monitorSplitter_, 1);
 
     auto* sourceControls = new QWidget;
     auto* sourceLayout = new QHBoxLayout(sourceControls);
@@ -1808,6 +1842,7 @@ void MainWindow::createPanels() {
     timecodeLabel_->setObjectName(QStringLiteral("transportTimecode"));
     timecodeLabel_->setMinimumWidth(96);
     timecodeLabel_->setAlignment(Qt::AlignCenter);
+    timecodeLabel_->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
     transportLayout->addWidget(timecodeLabel_);
     centralLayout->addWidget(transportBar, 0);
     setCentralWidget(centralContainer);
@@ -2001,19 +2036,44 @@ void MainWindow::createPanels() {
                     startAssetCacheJobs(relinkAssetId);
                 }
             });
-    addDockWidget(Qt::LeftDockWidgetArea, createDock(tr("Project"), projectPanel, this));
+    QDockWidget* projectDock = createDock(tr("Project"), projectPanel, this);
+    projectDock->setObjectName(QStringLiteral("ProjectDock"));
+    addDockWidget(Qt::LeftDockWidgetArea, projectDock);
 
-    auto* inspector = new QWidget;
-    auto* inspectorLayout = new QFormLayout(inspector);
-    opacitySpin_ = new QDoubleSpinBox;
+    auto* inspector = new QWidget(this);
+    inspector->hide();
+    const auto makePropertyForm = [this](PropertySection*& section, const QString& title,
+                                         const QString& settingsKey) {
+        section = new PropertySection(title, settingsKey);
+        auto* host = new QWidget(section);
+        auto* form = new QFormLayout(host);
+        form->setContentsMargins(0, 0, 0, 0);
+        form->setHorizontalSpacing(10);
+        form->setVerticalSpacing(6);
+        form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+        section->contentLayout()->addWidget(host);
+        return form;
+    };
+    QFormLayout* compositingLayout =
+        makePropertyForm(compositingSection_, tr("Compositing"), QStringLiteral("compositing"));
+    QFormLayout* audioLayout =
+        makePropertyForm(audioSection_, tr("Audio"), QStringLiteral("audio"));
+    QFormLayout* timingLayout =
+        makePropertyForm(timingSection_, tr("Speed / Duration"), QStringLiteral("timing"));
+    QFormLayout* transformLayout =
+        makePropertyForm(transformSection_, tr("Transform"), QStringLiteral("transform"));
+    QFormLayout* cropMaskLayout =
+        makePropertyForm(cropMaskSection_, tr("Crop / Mask"), QStringLiteral("cropMask"));
+    opacitySpin_ = new MixedDoubleSpinBox;
     opacitySpin_->setRange(0.0, 100.0);
     opacitySpin_->setDecimals(1);
     opacitySpin_->setSuffix(tr(" %"));
-    gainSpin_ = new QDoubleSpinBox;
+    gainSpin_ = new MixedDoubleSpinBox;
     gainSpin_->setRange(-60.0, 24.0);
     gainSpin_->setDecimals(1);
     gainSpin_->setSuffix(tr(" dB"));
     gainInterpolationCombo_ = new QComboBox(inspector);
+    gainInterpolationCombo_->addItem(tr("— No key at playhead —"), QVariant{});
     gainInterpolationCombo_->addItem(tr("Linear"),
         static_cast<int>(core::KeyframeInterpolation::Linear));
     gainInterpolationCombo_->addItem(tr("Hold"),
@@ -2026,12 +2086,13 @@ void MainWindow::createPanels() {
         static_cast<int>(core::KeyframeInterpolation::EaseOut));
     gainInterpolationCombo_->addItem(tr("Ease In-Out"),
         static_cast<int>(core::KeyframeInterpolation::EaseInOut));
-    rateSpin_ = new QDoubleSpinBox;
+    rateSpin_ = new MixedDoubleSpinBox;
     rateSpin_->setRange(0.25, 4.0);
     rateSpin_->setDecimals(2);
     rateSpin_->setSingleStep(0.05);
     rateSpin_->setSuffix(QStringLiteral("x"));
     speedInterpolationCombo_ = new QComboBox(inspector);
+    speedInterpolationCombo_->addItem(tr("— No key at playhead —"), QVariant{});
     speedInterpolationCombo_->addItem(tr("Linear"),
         static_cast<int>(core::KeyframeInterpolation::Linear));
     speedInterpolationCombo_->addItem(tr("Hold"),
@@ -2044,17 +2105,17 @@ void MainWindow::createPanels() {
         static_cast<int>(core::KeyframeInterpolation::EaseOut));
     speedInterpolationCombo_->addItem(tr("Ease In-Out"),
         static_cast<int>(core::KeyframeInterpolation::EaseInOut));
-    fadeInSpin_ = new QDoubleSpinBox;
+    fadeInSpin_ = new MixedDoubleSpinBox;
     fadeInSpin_->setRange(0.0, 100'000.0);
     fadeInSpin_->setDecimals(0);
     fadeInSpin_->setSuffix(tr(" frames"));
-    fadeOutSpin_ = new QDoubleSpinBox;
+    fadeOutSpin_ = new MixedDoubleSpinBox;
     fadeOutSpin_->setRange(0.0, 100'000.0);
     fadeOutSpin_->setDecimals(0);
     fadeOutSpin_->setSuffix(tr(" frames"));
     auto makeTransformSpin = [inspector](const double minimum, const double maximum,
                                          const double value, const QString& suffix) {
-        auto* spin = new QDoubleSpinBox(inspector);
+        auto* spin = new MixedDoubleSpinBox(inspector);
         spin->setRange(minimum, maximum);
         spin->setDecimals(2);
         spin->setValue(value);
@@ -2069,6 +2130,7 @@ void MainWindow::createPanels() {
     anchorXSpin_ = makeTransformSpin(0.0, 100.0, 50.0, tr(" %"));
     anchorYSpin_ = makeTransformSpin(0.0, 100.0, 50.0, tr(" %"));
     motionInterpolationCombo_ = new QComboBox(inspector);
+    motionInterpolationCombo_->addItem(tr("— No key at playhead —"), QVariant{});
     motionInterpolationCombo_->addItem(tr("Linear"),
         static_cast<int>(core::KeyframeInterpolation::Linear));
     motionInterpolationCombo_->addItem(tr("Hold"),
@@ -2095,13 +2157,19 @@ void MainWindow::createPanels() {
     maskHeightSpin_ = makeTransformSpin(0.1, 200.0, 100.0, tr(" %"));
     maskFeatherSpin_ = makeTransformSpin(0.0, 50.0, 0.0, tr(" %"));
     maskInvertedCheck_ = new QCheckBox(tr("Invert mask"), inspector);
-    inspectorLayout->addRow(tr("Opacity"), opacitySpin_);
-    inspectorLayout->addRow(tr("Audio gain"), gainSpin_);
-    inspectorLayout->addRow(tr("Gain interpolation"), gainInterpolationCombo_);
-    auto* setGainKeyframe = new QPushButton(tr("Add/Update Gain Keyframe"), inspector);
-    auto* removeGainKeyframe = new QPushButton(tr("Remove Gain Keyframe Here"), inspector);
-    inspectorLayout->addRow(setGainKeyframe);
-    inspectorLayout->addRow(removeGainKeyframe);
+    compositingLayout->addRow(tr("Opacity"), opacitySpin_);
+    audioLayout->addRow(tr("Gain"), gainSpin_);
+    audioLayout->addRow(tr("Interpolation"), gainInterpolationCombo_);
+    auto* setGainKeyframe = new QPushButton(QStringLiteral("◆"), inspector);
+    auto* removeGainKeyframe = new QPushButton(QStringLiteral("◇"), inspector);
+    setGainKeyframe->setToolTip(tr("Add or update a gain keyframe at the playhead"));
+    removeGainKeyframe->setToolTip(tr("Remove the gain keyframe at the playhead"));
+    auto* gainKeyActionRow = new QWidget(inspector);
+    auto* gainKeyActionLayout = new QHBoxLayout(gainKeyActionRow);
+    gainKeyActionLayout->setContentsMargins(0, 0, 0, 0);
+    gainKeyActionLayout->addWidget(setGainKeyframe);
+    gainKeyActionLayout->addWidget(removeGainKeyframe);
+    audioLayout->addRow(tr("Keyframe"), gainKeyActionRow);
     auto* gainNavRow = new QWidget(inspector);
     auto* gainNavLayout = new QHBoxLayout(gainNavRow);
     gainNavLayout->setContentsMargins(0, 0, 0, 0);
@@ -2114,7 +2182,7 @@ void MainWindow::createPanels() {
     gainNavLayout->addWidget(previousGainKey);
     gainNavLayout->addWidget(nextGainKey);
     gainNavLayout->addWidget(clearGainKeys);
-    inspectorLayout->addRow(tr("Gain keys"), gainNavRow);
+    audioLayout->addRow(tr("Keys"), gainNavRow);
     const auto jumpGainKey = [this](const bool forward) {
         const core::Clip* clip = editSession_.sequence().findClip(inspectedClip_);
         if (clip == nullptr || timeline_ == nullptr || clip->gainKeyframes.empty()) {
@@ -2168,26 +2236,38 @@ void MainWindow::createPanels() {
             updateInspector(inspectedClip_);
         }
     });
-    inspectorLayout->addRow(tr("Playback rate"), rateSpin_);
-    inspectorLayout->addRow(tr("Speed interpolation"), speedInterpolationCombo_);
-    auto* setSpeedKeyframe = new QPushButton(tr("Add/Update Speed Keyframe"), inspector);
-    auto* removeSpeedKeyframe = new QPushButton(tr("Remove Speed Keyframe Here"), inspector);
-    inspectorLayout->addRow(setSpeedKeyframe);
-    inspectorLayout->addRow(removeSpeedKeyframe);
-    inspectorLayout->addRow(tr("Fade in"), fadeInSpin_);
-    inspectorLayout->addRow(tr("Fade out"), fadeOutSpin_);
-    inspectorLayout->addRow(tr("Position X"), positionXSpin_);
-    inspectorLayout->addRow(tr("Position Y"), positionYSpin_);
-    inspectorLayout->addRow(tr("Scale X"), scaleXSpin_);
-    inspectorLayout->addRow(tr("Scale Y"), scaleYSpin_);
-    inspectorLayout->addRow(tr("Rotation"), rotationSpin_);
-    inspectorLayout->addRow(tr("Anchor X"), anchorXSpin_);
-    inspectorLayout->addRow(tr("Anchor Y"), anchorYSpin_);
-    inspectorLayout->addRow(tr("Motion interpolation"), motionInterpolationCombo_);
-    auto* setMotionKeyframe = new QPushButton(tr("Add/Update Motion Keyframe"), inspector);
-    auto* removeMotionKeyframe = new QPushButton(tr("Remove Motion Keyframe Here"), inspector);
-    inspectorLayout->addRow(setMotionKeyframe);
-    inspectorLayout->addRow(removeMotionKeyframe);
+    timingLayout->addRow(tr("Playback rate"), rateSpin_);
+    timingLayout->addRow(tr("Interpolation"), speedInterpolationCombo_);
+    auto* setSpeedKeyframe = new QPushButton(QStringLiteral("◆"), inspector);
+    auto* removeSpeedKeyframe = new QPushButton(QStringLiteral("◇"), inspector);
+    setSpeedKeyframe->setToolTip(tr("Add or update a speed keyframe at the playhead"));
+    removeSpeedKeyframe->setToolTip(tr("Remove the speed keyframe at the playhead"));
+    auto* speedKeyActionRow = new QWidget(inspector);
+    auto* speedKeyActionLayout = new QHBoxLayout(speedKeyActionRow);
+    speedKeyActionLayout->setContentsMargins(0, 0, 0, 0);
+    speedKeyActionLayout->addWidget(setSpeedKeyframe);
+    speedKeyActionLayout->addWidget(removeSpeedKeyframe);
+    timingLayout->addRow(tr("Keyframe"), speedKeyActionRow);
+    compositingLayout->addRow(tr("Fade in"), fadeInSpin_);
+    compositingLayout->addRow(tr("Fade out"), fadeOutSpin_);
+    transformLayout->addRow(tr("Position X"), positionXSpin_);
+    transformLayout->addRow(tr("Position Y"), positionYSpin_);
+    transformLayout->addRow(tr("Scale X"), scaleXSpin_);
+    transformLayout->addRow(tr("Scale Y"), scaleYSpin_);
+    transformLayout->addRow(tr("Rotation"), rotationSpin_);
+    transformLayout->addRow(tr("Anchor X"), anchorXSpin_);
+    transformLayout->addRow(tr("Anchor Y"), anchorYSpin_);
+    transformLayout->addRow(tr("Interpolation"), motionInterpolationCombo_);
+    auto* setMotionKeyframe = new QPushButton(QStringLiteral("◆"), inspector);
+    auto* removeMotionKeyframe = new QPushButton(QStringLiteral("◇"), inspector);
+    setMotionKeyframe->setToolTip(tr("Add or update a transform keyframe at the playhead"));
+    removeMotionKeyframe->setToolTip(tr("Remove the transform keyframe at the playhead"));
+    auto* motionKeyActionRow = new QWidget(inspector);
+    auto* motionKeyActionLayout = new QHBoxLayout(motionKeyActionRow);
+    motionKeyActionLayout->setContentsMargins(0, 0, 0, 0);
+    motionKeyActionLayout->addWidget(setMotionKeyframe);
+    motionKeyActionLayout->addWidget(removeMotionKeyframe);
+    transformLayout->addRow(tr("Keyframe"), motionKeyActionRow);
     auto* motionNavRow = new QWidget(inspector);
     auto* motionNavLayout = new QHBoxLayout(motionNavRow);
     motionNavLayout->setContentsMargins(0, 0, 0, 0);
@@ -2201,7 +2281,7 @@ void MainWindow::createPanels() {
     motionNavLayout->addWidget(previousMotionKey);
     motionNavLayout->addWidget(nextMotionKey);
     motionNavLayout->addWidget(clearMotionKeys);
-    inspectorLayout->addRow(tr("Motion keys"), motionNavRow);
+    transformLayout->addRow(tr("Keys"), motionNavRow);
     const auto jumpMotionKey = [this](const bool forward) {
         const core::Clip* clip = editSession_.sequence().findClip(inspectedClip_);
         if (clip == nullptr || timeline_ == nullptr || clip->motionKeyframes.empty()) {
@@ -2257,23 +2337,26 @@ void MainWindow::createPanels() {
             updateProgramFrame(timeline_->playheadFrame());
         }
     });
-    inspectorLayout->addRow(tr("Crop Left"), cropLeftSpin_);
-    inspectorLayout->addRow(tr("Crop Right"), cropRightSpin_);
-    inspectorLayout->addRow(tr("Crop Top"), cropTopSpin_);
-    inspectorLayout->addRow(tr("Crop Bottom"), cropBottomSpin_);
-    inspectorLayout->addRow(tr("Mask Shape"), maskShapeCombo_);
-    inspectorLayout->addRow(tr("Mask Center X"), maskCenterXSpin_);
-    inspectorLayout->addRow(tr("Mask Center Y"), maskCenterYSpin_);
-    inspectorLayout->addRow(tr("Mask Width"), maskWidthSpin_);
-    inspectorLayout->addRow(tr("Mask Height"), maskHeightSpin_);
-    inspectorLayout->addRow(tr("Mask Feather"), maskFeatherSpin_);
-    inspectorLayout->addRow(maskInvertedCheck_);
+    cropMaskLayout->addRow(tr("Crop left"), cropLeftSpin_);
+    cropMaskLayout->addRow(tr("Crop right"), cropRightSpin_);
+    cropMaskLayout->addRow(tr("Crop top"), cropTopSpin_);
+    cropMaskLayout->addRow(tr("Crop bottom"), cropBottomSpin_);
+    cropMaskLayout->addRow(tr("Mask shape"), maskShapeCombo_);
+    cropMaskLayout->addRow(tr("Center X"), maskCenterXSpin_);
+    cropMaskLayout->addRow(tr("Center Y"), maskCenterYSpin_);
+    cropMaskLayout->addRow(tr("Width"), maskWidthSpin_);
+    cropMaskLayout->addRow(tr("Height"), maskHeightSpin_);
+    cropMaskLayout->addRow(tr("Feather"), maskFeatherSpin_);
+    cropMaskLayout->addRow(maskInvertedCheck_);
     auto* resetTransform = new QPushButton(tr("Reset Transform"), inspector);
-    inspectorLayout->addRow(resetTransform);
+    resetTransform->setProperty("inspectorGroup", QStringLiteral("transform"));
+    transformLayout->addRow(resetTransform);
     auto* resetCrop = new QPushButton(tr("Reset Crop"), inspector);
-    inspectorLayout->addRow(resetCrop);
+    resetCrop->setProperty("inspectorGroup", QStringLiteral("crop"));
+    cropMaskLayout->addRow(resetCrop);
     auto* resetMask = new QPushButton(tr("Reset Mask"), inspector);
-    inspectorLayout->addRow(resetMask);
+    resetMask->setProperty("inspectorGroup", QStringLiteral("mask"));
+    cropMaskLayout->addRow(resetMask);
     for (QDoubleSpinBox* spin : {opacitySpin_, gainSpin_, rateSpin_, fadeInSpin_, fadeOutSpin_,
                                  positionXSpin_, positionYSpin_, scaleXSpin_, scaleYSpin_,
                                  rotationSpin_, anchorXSpin_, anchorYSpin_, cropLeftSpin_,
@@ -2282,7 +2365,11 @@ void MainWindow::createPanels() {
                                  maskFeatherSpin_}) {
         spin->setEnabled(false);
         connect(spin, &QDoubleSpinBox::editingFinished, this,
-                [this] { applyInspectorProperties(); });
+                [this, spin] {
+                    inspectorEditSource_ = spin;
+                    applyInspectorProperties();
+                    inspectorEditSource_ = nullptr;
+                });
     }
     const auto livePreviewTransform = [this] {
         if (programMonitor_ == nullptr) {
@@ -2312,7 +2399,7 @@ void MainWindow::createPanels() {
     }
     auto* editCropButton = new QPushButton(tr("Edit Crop in Monitor"), inspector);
     editCropButton->setCheckable(true);
-    inspectorLayout->addRow(editCropButton);
+    cropMaskLayout->addRow(editCropButton);
     connect(editCropButton, &QPushButton::toggled, this, [this](const bool enabled) {
         if (programMonitor_ != nullptr) {
             programMonitor_->setCropEditMode(enabled);
@@ -2328,11 +2415,19 @@ void MainWindow::createPanels() {
         if (spin == nullptr) {
             continue;
         }
-        if (auto* label = qobject_cast<QLabel*>(inspectorLayout->labelForField(spin))) {
-            scrubController->attach(label, spin, [this] { applyInspectorProperties(); });
+        for (QFormLayout* form : {compositingLayout, audioLayout, timingLayout,
+                                  transformLayout, cropMaskLayout}) {
+            if (auto* label = qobject_cast<QLabel*>(form->labelForField(spin))) {
+                scrubController->attach(label, spin, [this, spin] {
+                    inspectorEditSource_ = spin;
+                    applyInspectorProperties();
+                    inspectorEditSource_ = nullptr;
+                });
+                break;
+            }
         }
     }
-    connect(resetTransform, &QPushButton::clicked, this, [this] {
+    connect(resetTransform, &QPushButton::clicked, this, [this, resetTransform] {
         positionXSpin_->setValue(0.0);
         positionYSpin_->setValue(0.0);
         scaleXSpin_->setValue(100.0);
@@ -2340,20 +2435,35 @@ void MainWindow::createPanels() {
         rotationSpin_->setValue(0.0);
         anchorXSpin_->setValue(50.0);
         anchorYSpin_->setValue(50.0);
+        inspectorEditSource_ = resetTransform;
         applyInspectorProperties();
+        inspectorEditSource_ = nullptr;
     });
-    connect(resetCrop, &QPushButton::clicked, this, [this] {
+    connect(resetCrop, &QPushButton::clicked, this, [this, resetCrop] {
         cropLeftSpin_->setValue(0.0);
         cropRightSpin_->setValue(0.0);
         cropTopSpin_->setValue(0.0);
         cropBottomSpin_->setValue(0.0);
+        inspectorEditSource_ = resetCrop;
         applyInspectorProperties();
+        inspectorEditSource_ = nullptr;
     });
     connect(maskShapeCombo_, &QComboBox::currentIndexChanged, this,
-            [this] { applyInspectorProperties(); });
+            [this] {
+                inspectorEditSource_ = maskShapeCombo_;
+                applyInspectorProperties();
+                inspectorEditSource_ = nullptr;
+            });
     connect(maskInvertedCheck_, &QCheckBox::toggled, this,
-            [this] { applyInspectorProperties(); });
-    connect(resetMask, &QPushButton::clicked, this, [this] {
+            [this] {
+                inspectorEditSource_ = maskInvertedCheck_;
+                applyInspectorProperties();
+                inspectorEditSource_ = nullptr;
+            });
+    connect(resetMask, &QPushButton::clicked, this, [this, resetMask] {
+        inspectorEditSource_ = resetMask;
+        const QSignalBlocker shapeBlocker(maskShapeCombo_);
+        const QSignalBlocker invertBlocker(maskInvertedCheck_);
         maskShapeCombo_->setCurrentIndex(0);
         maskCenterXSpin_->setValue(50.0);
         maskCenterYSpin_->setValue(50.0);
@@ -2362,6 +2472,7 @@ void MainWindow::createPanels() {
         maskFeatherSpin_->setValue(0.0);
         maskInvertedCheck_->setChecked(false);
         applyInspectorProperties();
+        inspectorEditSource_ = nullptr;
     });
     connect(setSpeedKeyframe, &QPushButton::clicked, this, [this] {
         const core::Clip* clip = editSession_.sequence().findClip(inspectedClip_);
@@ -2669,6 +2780,10 @@ void MainWindow::createPanels() {
             return;
         }
         updateTextPanel();
+        if (textSection_ != nullptr) {
+            textSection_->setVisible(true);
+            textSection_->setExpanded(true);
+        }
         QWidget* ancestor = textEditField_->parentWidget();
         while (ancestor != nullptr && qobject_cast<QDockWidget*>(ancestor) == nullptr) {
             ancestor = ancestor->parentWidget();
@@ -2687,12 +2802,6 @@ void MainWindow::createPanels() {
         }
     });
     programMonitor_->setZoomReferenceSize(1280, 720);
-    auto* inspectorScroll = new QScrollArea;
-    inspectorScroll->setWidget(inspector);
-    inspectorScroll->setWidgetResizable(true);
-    inspectorScroll->setFrameShape(QFrame::NoFrame);
-    QDockWidget* inspectorDock = createDock(tr("Inspector"), inspectorScroll, this);
-    addDockWidget(Qt::RightDockWidgetArea, inspectorDock);
 
     auto* effectsPanel = new QWidget;
     auto* effectsLayout = new QVBoxLayout(effectsPanel);
@@ -2706,12 +2815,20 @@ void MainWindow::createPanels() {
     }
     auto* addEffectButton = new QPushButton(tr("Add Effect"), effectsPanel);
     effectsList_ = new QListWidget(effectsPanel);
+    effectsList_->setObjectName(QStringLiteral("effectCards"));
+    effectsList_->setSpacing(6);
+    effectsList_->setDragEnabled(true);
+    effectsList_->setAcceptDrops(true);
+    effectsList_->setDropIndicatorShown(true);
+    effectsList_->setDragDropMode(QAbstractItemView::InternalMove);
+    effectsList_->setDefaultDropAction(Qt::MoveAction);
     effectEnabledCheck_ = new QCheckBox(tr("Enabled"), effectsPanel);
     effectAmountSpin_ = new QDoubleSpinBox(effectsPanel);
     effectAmountSpin_->setDecimals(3);
     effectAmountSpin_->setRange(-1.0, 3.0);
     effectAmountSpin_->setSingleStep(0.05);
     effectInterpolationCombo_ = new QComboBox(effectsPanel);
+    effectInterpolationCombo_->addItem(tr("— No key at playhead —"), QVariant{});
     effectInterpolationCombo_->addItem(tr("Linear"),
         static_cast<int>(core::KeyframeInterpolation::Linear));
     effectInterpolationCombo_->addItem(tr("Hold"),
@@ -2771,6 +2888,35 @@ void MainWindow::createPanels() {
     });
     connect(effectsList_, &QListWidget::currentItemChanged, this,
             [this](QListWidgetItem*, QListWidgetItem*) { updateEffectsPanel(); });
+    connect(effectsList_->model(), &QAbstractItemModel::rowsMoved, this,
+            [this](const QModelIndex&, const int sourceStart, const int,
+                   const QModelIndex&, const int destinationRow) {
+                if (!inspectedClip_ || sourceStart < 0 || effectsList_ == nullptr) {
+                    return;
+                }
+                const int targetRow =
+                    destinationRow > sourceStart ? destinationRow - 1 : destinationRow;
+                if (targetRow < 0 || targetRow >= effectsList_->count() ||
+                    targetRow == sourceStart) {
+                    return;
+                }
+                QListWidgetItem* item = effectsList_->item(targetRow);
+                if (item == nullptr) return;
+                const core::EffectId effectId{item->data(Qt::UserRole).toULongLong()};
+                const core::EditResult result = editSession_.apply({
+                    .baseRevision = editSession_.sequence().revision(),
+                    .label = "Reorder effect",
+                    .command = core::MoveEffectCommand{inspectedClip_, effectId,
+                                                       targetRow - sourceStart},
+                });
+                if (result.succeeded()) {
+                    setDirty(true);
+                    QTimer::singleShot(0, this, [this] {
+                        refreshEditor();
+                        updateProgramFrame(timeline_->playheadFrame());
+                    });
+                }
+            });
     connect(effectEnabledCheck_, &QCheckBox::toggled, this,
             [this](const bool) { applySelectedEffect(); });
     connect(effectAmountSpin_, &QDoubleSpinBox::editingFinished, this,
@@ -3086,9 +3232,6 @@ void MainWindow::createPanels() {
             [jumpToEffectKeyframe] { jumpToEffectKeyframe(false); });
     connect(nextKeyButton, &QPushButton::clicked, this,
             [jumpToEffectKeyframe] { jumpToEffectKeyframe(true); });
-    QDockWidget* effectsDock = createDock(tr("Effect Controls"), effectsPanel, this);
-    addDockWidget(Qt::RightDockWidgetArea, effectsDock);
-
     auto* browserPanel = new QWidget;
     auto* browserLayout = new QVBoxLayout(browserPanel);
     effectsBrowserSearch_ = new QLineEdit(browserPanel);
@@ -3267,8 +3410,6 @@ void MainWindow::createPanels() {
             });
     applyBrowserEffect_ = applyBrowserEffect;
     effectsBrowserList_->viewport()->installEventFilter(this);
-    QDockWidget* browserDock = createDock(tr("Effects Browser"), browserPanel, this);
-    addDockWidget(Qt::RightDockWidgetArea, browserDock);
 
     historyList_ = new QListWidget;
     historyList_->setToolTip(tr("Double-click a state to move through undo/redo history"));
@@ -3290,6 +3431,7 @@ void MainWindow::createPanels() {
         }
     });
     QDockWidget* historyDock = createDock(tr("History"), historyList_, this);
+    historyDock->setObjectName(QStringLiteral("HistoryDock"));
     addDockWidget(Qt::RightDockWidgetArea, historyDock);
 
     auto* metersPanel = new QWidget;
@@ -3308,6 +3450,7 @@ void MainWindow::createPanels() {
     meterRowLayout->addWidget(rightAudioMeter_);
     metersLayout->addRow(tr("L / R"), meterRow);
     QDockWidget* metersDock = createDock(tr("Audio Meters"), metersPanel, this);
+    metersDock->setObjectName(QStringLiteral("AudioMetersDock"));
     addDockWidget(Qt::RightDockWidgetArea, metersDock);
 
     auto* textPanel = new QWidget;
@@ -3406,19 +3549,45 @@ void MainWindow::createPanels() {
             updateCaptionOverlay(timeline_->playheadFrame());
         }
     });
-    auto* textScroll = new QScrollArea;
-    textScroll->setWidget(textPanel);
-    textScroll->setWidgetResizable(true);
-    textScroll->setFrameShape(QFrame::NoFrame);
-    QDockWidget* textDock = createDock(tr("Text"), textScroll, this);
-    addDockWidget(Qt::RightDockWidgetArea, textDock);
+    for (QWidget* legacyEffectControl :
+         {static_cast<QWidget*>(effectTypeCombo_), static_cast<QWidget*>(addEffectButton),
+          static_cast<QWidget*>(effectEnabledCheck_), static_cast<QWidget*>(effectAmountSpin_),
+          static_cast<QWidget*>(effectInterpolationCombo_),
+          static_cast<QWidget*>(addKeyframeButton),
+          static_cast<QWidget*>(removeKeyframeButton),
+          static_cast<QWidget*>(removeEffectButton), reorderRow, keyNavRow}) {
+        legacyEffectControl->hide();
+    }
+    effectsSection_ =
+        new PropertySection(tr("Effects"), QStringLiteral("effects"), this);
+    effectsSection_->contentLayout()->addWidget(effectsPanel);
+    addEffectSection_ =
+        new PropertySection(tr("Add Effect"), QStringLiteral("addEffect"), this);
+    addEffectSection_->contentLayout()->addWidget(browserPanel);
+    textSection_ =
+        new PropertySection(tr("Text"), QStringLiteral("text"), this);
+    textSection_->contentLayout()->addWidget(textPanel);
 
-    tabifyDockWidget(inspectorDock, effectsDock);
-    tabifyDockWidget(effectsDock, browserDock);
-    tabifyDockWidget(browserDock, textDock);
-    tabifyDockWidget(textDock, historyDock);
+    contextRail_ = new ContextRail(this);
+    contextRail_->bindSelectionModel(selectionModel_);
+    contextRail_->addSection(compositingSection_);
+    contextRail_->addSection(transformSection_);
+    contextRail_->addSection(cropMaskSection_);
+    contextRail_->addSection(timingSection_);
+    contextRail_->addSection(audioSection_);
+    contextRail_->addSection(textSection_);
+    contextRail_->addSection(effectsSection_);
+    contextRail_->addSection(addEffectSection_);
+    contextRail_->setPinnedWidget(keyframeLanesWidget_);
+    QDockWidget* contextDock = createDock(tr("Properties"), contextRail_, this);
+    contextDock->setObjectName(QStringLiteral("ContextRailDock"));
+    contextDock->setMinimumWidth(320);
+    addDockWidget(Qt::RightDockWidgetArea, contextDock);
+
     tabifyDockWidget(historyDock, metersDock);
-    inspectorDock->raise();
+    historyDock->hide();
+    metersDock->hide();
+    contextDock->raise();
 
     timeline_ = new TimelineWidget;
     timeline_->setMinimumHeight(280);
@@ -3443,6 +3612,7 @@ void MainWindow::createPanels() {
             inspect = clipIds.back();
         }
         updateInspector(inspect);
+        updateSelectionContext(clipIds);
     });
     timeline_->setContextActionHandler(
         [this](const TimelineWidget::ContextAction action, const core::ClipId clipId,
@@ -4570,9 +4740,11 @@ void MainWindow::createPanels() {
         updateCaptionOverlay(timelineFrame);
         if (!playbackRequested_) {
             updateProgramFrame(timelineFrame);
-            updateEffectsPanel();
-            updateTextPanel();
-            if (inspectedClip_) updateInspector(inspectedClip_);
+            if (inspectedClip_) {
+                updateInspector(inspectedClip_);
+            } else {
+                updateTextPanel();
+            }
         }
     });
     timeline_->setTransportHandler([this] { togglePlayback(); });
@@ -4884,13 +5056,23 @@ void MainWindow::createPanels() {
         }
     });
     QDockWidget* timelineDock = createDock(tr("Timeline"), timeline_, this);
+    timelineDock->setObjectName(QStringLiteral("TimelineDock"));
     addDockWidget(Qt::BottomDockWidgetArea, timelineDock);
 
     jobsList_ = new QListWidget;
     jobsList_->addItem(tr("No background jobs"));
     QDockWidget* jobsDock = createDock(tr("Jobs"), jobsList_, this);
+    jobsDock->setObjectName(QStringLiteral("JobsDock"));
     addDockWidget(Qt::BottomDockWidgetArea, jobsDock);
     resizeDocks({timelineDock, jobsDock}, {1150, 240}, Qt::Horizontal);
+
+    if (windowMenu_ != nullptr) {
+        windowMenu_->addSection(tr("Panels"));
+        for (QDockWidget* dock :
+             {projectDock, contextDock, timelineDock, jobsDock, historyDock, metersDock}) {
+            windowMenu_->addAction(dock->toggleViewAction());
+        }
+    }
 }
 
 void MainWindow::createStatusBar() {
@@ -6523,6 +6705,52 @@ void MainWindow::ensureMediaPlayer() {
             [this](const QVideoFrame& frame) {
                 const QImage image = frame.toImage();
                 if (!image.isNull() && programMonitor_ != nullptr && playbackRequested_) {
+                    // The decoder and transport timer are asynchronous. Apply
+                    // animation from the decoded frame's media timestamp here,
+                    // immediately before presenting it; otherwise a newly
+                    // arrived image can be painted with the transform/effect
+                    // state left over from an earlier timer tick.
+                    if (mediaPlaybackClip_ && mediaPlayer_ != nullptr) {
+                        if (const core::Clip* clip =
+                                editSession_.sequence().findClip(mediaPlaybackClip_)) {
+                            const double framesPerSecond =
+                                editSession_.sequence().frameRate().framesPerSecond();
+                            const core::Frame sourceFrame =
+                                static_cast<core::Frame>(std::floor(
+                                    static_cast<double>(mediaPlayer_->position()) *
+                                    framesPerSecond / 1000.0));
+                            const core::Frame localFrame =
+                                std::clamp<core::Frame>(
+                                    static_cast<core::Frame>(std::floor(
+                                        static_cast<double>(
+                                            sourceFrame - clip->sourceStart) /
+                                        clip->playbackRate)),
+                                    0, std::max<core::Frame>(
+                                           0, clip->timeline.duration - 1));
+                            const core::Frame timelineFrame =
+                                clip->timeline.start + localFrame;
+                            const core::MotionKeyframe motion =
+                                motionAt(*clip, localFrame);
+                            programMonitor_->setFrameOpacity(
+                                motion.opacity *
+                                clipEnvelope(*clip, timelineFrame));
+                            programMonitor_->setFrameTransform(
+                                motion.positionX, motion.positionY,
+                                motion.scaleX, motion.scaleY,
+                                motion.rotationDegrees, motion.anchorX,
+                                motion.anchorY);
+                            programMonitor_->setFrameCrop(
+                                clip->cropLeft, clip->cropRight,
+                                clip->cropTop, clip->cropBottom);
+                            programMonitor_->setFrameMask(
+                                static_cast<int>(clip->maskShape),
+                                clip->maskCenterX, clip->maskCenterY,
+                                clip->maskWidth, clip->maskHeight,
+                                clip->maskFeather, clip->maskInverted);
+                            applyClipEffects(programMonitor_, *clip,
+                                             timelineFrame);
+                        }
+                    }
                     programMonitor_->setFrame(image);
                 }
             });
@@ -7643,7 +7871,32 @@ void MainWindow::updateTextPanel() {
     }
     if (!enabled) {
         textStatusLabel_->setText(tr("No text at the playhead. Use New Text or press T."));
+        if (timeline_ != nullptr && timeline_->selectedClipIds().empty() &&
+            selectionModel_ != nullptr) {
+            selectionModel_->clear();
+            if (textSection_ != nullptr) textSection_->hide();
+        }
         return;
+    }
+    if (timeline_ != nullptr && timeline_->selectedClipIds().empty() &&
+        selectionModel_ != nullptr) {
+        selectionModel_->setState({
+            .kind = SelectionKind::Caption,
+            .title = tr("Caption"),
+            .subtitle = tr("%1–%2  ·  %3 frames")
+                            .arg(caption->timeline.start)
+                            .arg(caption->timeline.end())
+                            .arg(caption->timeline.duration),
+        });
+        for (PropertySection* section :
+             {compositingSection_, audioSection_, timingSection_, transformSection_,
+              cropMaskSection_, effectsSection_, addEffectSection_}) {
+            if (section != nullptr) section->hide();
+        }
+        if (textSection_ != nullptr) {
+            textSection_->show();
+            textSection_->setExpanded(true);
+        }
     }
     textStatusLabel_->setText(tr("Editing text at %1-%2")
                                   .arg(caption->timeline.start)
@@ -8124,6 +8377,67 @@ void MainWindow::restoreWorkspaceState() {
     }
 }
 
+void MainWindow::applyWorkspacePreset(const int preset) {
+    const auto dock = [this](const char* name) {
+        return findChild<QDockWidget*>(QString::fromLatin1(name));
+    };
+    QDockWidget* project = dock("ProjectDock");
+    QDockWidget* properties = dock("ContextRailDock");
+    QDockWidget* timeline = dock("TimelineDock");
+    QDockWidget* jobs = dock("JobsDock");
+    QDockWidget* history = dock("HistoryDock");
+    QDockWidget* meters = dock("AudioMetersDock");
+    if (properties != nullptr) properties->show();
+    if (timeline != nullptr) timeline->show();
+    if (jobs != nullptr) jobs->hide();
+    if (history != nullptr) history->hide();
+    if (meters != nullptr) meters->hide();
+
+    switch (preset) {
+    case 1: // Effects
+        if (project != nullptr) project->hide();
+        if (effectsSection_ != nullptr) {
+            effectsSection_->show();
+            effectsSection_->setExpanded(true);
+        }
+        if (addEffectSection_ != nullptr) addEffectSection_->setExpanded(false);
+        if (monitorSplitter_ != nullptr) monitorSplitter_->setSizes({360, 1080});
+        break;
+    case 2: // Text
+        if (project != nullptr) project->show();
+        if (textSection_ != nullptr) {
+            textSection_->show();
+            textSection_->setExpanded(true);
+        }
+        if (monitorSplitter_ != nullptr) monitorSplitter_->setSizes({300, 1140});
+        break;
+    case 3: // Audio
+        if (project != nullptr) project->hide();
+        if (meters != nullptr) {
+            meters->show();
+            meters->raise();
+        }
+        if (audioSection_ != nullptr) {
+            audioSection_->show();
+            audioSection_->setExpanded(true);
+        }
+        if (monitorSplitter_ != nullptr) monitorSplitter_->setSizes({420, 1020});
+        break;
+    case 0:
+    default: // Editing
+        if (project != nullptr) project->show();
+        if (monitorSplitter_ != nullptr) monitorSplitter_->setSizes({600, 840});
+        break;
+    }
+    if (properties != nullptr) properties->raise();
+    statusBar()->showMessage(
+        preset == 1   ? tr("Effects workspace")
+        : preset == 2 ? tr("Text workspace")
+        : preset == 3 ? tr("Audio workspace")
+                      : tr("Editing workspace"),
+        1800);
+}
+
 void MainWindow::dragEnterEvent(QDragEnterEvent* event) {
     if (event->mimeData()->hasUrls()) {
         for (const QUrl& url : event->mimeData()->urls()) {
@@ -8409,7 +8723,288 @@ void MainWindow::refreshEditor() {
     if (inspectedClip_) {
         updateInspector(inspectedClip_);
     }
+    if (timeline_ != nullptr) {
+        updateSelectionContext(timeline_->selectedClipIds());
+    }
     updateHistoryPanel();
+}
+
+void MainWindow::updateSelectionContext(const std::vector<core::ClipId>& clipIds) {
+    if (selectionModel_ == nullptr) {
+        return;
+    }
+    if (clipIds.empty() || !inspectedClip_) {
+        selectionModel_->clear();
+        for (PropertySection* section :
+             {compositingSection_, audioSection_, timingSection_, transformSection_,
+              cropMaskSection_, effectsSection_, addEffectSection_, textSection_}) {
+            if (section != nullptr) {
+                section->setVisible(false);
+            }
+        }
+        return;
+    }
+
+    const core::Clip* primary = editSession_.sequence().findClip(inspectedClip_);
+    if (primary == nullptr) {
+        selectionModel_->clear();
+        return;
+    }
+
+    const core::Track* primaryTrack = nullptr;
+    int kindIndex = 0;
+    for (const core::Track& track : editSession_.sequence().tracks()) {
+        const auto clip = std::ranges::find(track.clips, inspectedClip_, &core::Clip::id);
+        if (clip != track.clips.end()) {
+            primaryTrack = &track;
+            if (track.kind == core::TrackKind::Video) {
+                for (const core::Track& candidate : editSession_.sequence().tracks()) {
+                    if (candidate.kind != core::TrackKind::Video) continue;
+                    ++kindIndex;
+                    if (candidate.id == track.id) break;
+                }
+            } else {
+                for (const core::Track& candidate : editSession_.sequence().tracks()) {
+                    if (candidate.kind != core::TrackKind::Audio) continue;
+                    ++kindIndex;
+                    if (candidate.id == track.id) break;
+                }
+            }
+            break;
+        }
+    }
+
+    const auto asset = std::ranges::find_if(
+        assets_, [primary](const ProjectAsset& candidate) {
+            return candidate.id == primary->assetId;
+        });
+    const bool title = asset != assets_.end() && isTitleAsset(asset->metadata);
+    QString displayName;
+    if (asset != assets_.end()) {
+        displayName = asset->metadata.value(QStringLiteral("display_name")).toString();
+        if (displayName.isEmpty()) {
+            displayName = QFileInfo(asset->path).fileName();
+        }
+    }
+    if (displayName.isEmpty()) {
+        displayName = tr("Clip %1").arg(primary->id.value);
+    }
+
+    const bool linkedBundle =
+        clipIds.size() > 1U && static_cast<bool>(primary->linkId) &&
+        std::ranges::all_of(clipIds, [this, primary](const core::ClipId id) {
+            const core::Clip* candidate = editSession_.sequence().findClip(id);
+            return candidate != nullptr && candidate->linkId == primary->linkId;
+        });
+    // A linked video/audio pair is one logical timeline item. Treating its two
+    // component clips as a generic multiple selection hides video-only
+    // properties such as Transform, Crop and Mask.
+    const bool multiple = clipIds.size() > 1U && !linkedBundle;
+
+    SelectionState state;
+    state.clipIds = clipIds;
+    state.primaryClip = inspectedClip_;
+    state.track = primaryTrack == nullptr ? core::TrackId{} : primaryTrack->id;
+    state.linked = static_cast<bool>(primary->linkId);
+    if (multiple) {
+        state.kind = SelectionKind::Multiple;
+        state.title = tr("%1 clips selected").arg(clipIds.size());
+    } else if (title) {
+        state.kind = SelectionKind::TitleClip;
+        state.title = displayName;
+    } else if (primaryTrack != nullptr && primaryTrack->kind == core::TrackKind::Audio) {
+        state.kind = SelectionKind::AudioClip;
+        state.title = displayName;
+    } else {
+        state.kind = SelectionKind::VideoClip;
+        state.title = displayName;
+    }
+    const QString trackName =
+        primaryTrack == nullptr
+            ? tr("Unknown track")
+            : (!primaryTrack->name.empty()
+                   ? QString::fromStdString(primaryTrack->name)
+                   : QStringLiteral("%1%2")
+                         .arg(primaryTrack->kind == core::TrackKind::Video
+                                  ? QStringLiteral("V")
+                                  : QStringLiteral("A"))
+                         .arg(std::max(1, kindIndex)));
+    state.subtitle =
+        tr("%1  ·  %2 frames%3")
+            .arg(trackName)
+            .arg(primary->timeline.duration)
+            .arg(state.linked ? tr("  ·  Linked A/V") : QString{});
+    selectionModel_->setState(std::move(state));
+
+    bool hasVideo = false;
+    bool hasAudio = false;
+    bool allTitles = true;
+    bool commonEffects = true;
+    std::vector<core::EffectType> primaryEffectTypes;
+    primaryEffectTypes.reserve(primary->effects.size());
+    for (const core::ClipEffect& effect : primary->effects) {
+        primaryEffectTypes.push_back(effect.type);
+    }
+    for (const core::ClipId id : clipIds) {
+        const core::Clip* candidate = editSession_.sequence().findClip(id);
+        if (candidate == nullptr) continue;
+        const core::Track* candidateTrack = nullptr;
+        for (const core::Track& track : editSession_.sequence().tracks()) {
+            if (std::ranges::any_of(track.clips, [id](const core::Clip& clip) {
+                    return clip.id == id;
+                })) {
+                candidateTrack = &track;
+                break;
+            }
+        }
+        hasVideo = hasVideo || (candidateTrack != nullptr &&
+                                candidateTrack->kind == core::TrackKind::Video);
+        hasAudio = hasAudio || (candidateTrack != nullptr &&
+                                candidateTrack->kind == core::TrackKind::Audio);
+        const auto candidateAsset = std::ranges::find_if(
+            assets_, [candidate](const ProjectAsset& projectAsset) {
+                return projectAsset.id == candidate->assetId;
+            });
+        allTitles = allTitles && candidateAsset != assets_.end() &&
+                    isTitleAsset(candidateAsset->metadata);
+        std::vector<core::EffectType> effectTypes;
+        effectTypes.reserve(candidate->effects.size());
+        for (const core::ClipEffect& effect : candidate->effects) {
+            effectTypes.push_back(effect.type);
+        }
+        commonEffects = commonEffects && effectTypes == primaryEffectTypes;
+    }
+    const core::Frame playhead = timeline_ == nullptr ? primary->timeline.start
+                                                       : timeline_->playheadFrame();
+    const auto localFrameFor = [playhead](const core::Clip& clip) {
+        return std::clamp<core::Frame>(
+            playhead - clip.timeline.start, 0, std::max<core::Frame>(0, clip.timeline.duration - 1));
+    };
+    const core::MotionKeyframe primaryMotion =
+        motionAt(*primary, localFrameFor(*primary));
+    const auto differs = [](const double left, const double right) {
+        return std::abs(left - right) > 1.0e-7;
+    };
+    struct MixedFields {
+        bool opacity = false;
+        bool gain = false;
+        bool rate = false;
+        bool fadeIn = false;
+        bool fadeOut = false;
+        bool positionX = false;
+        bool positionY = false;
+        bool scaleX = false;
+        bool scaleY = false;
+        bool rotation = false;
+        bool anchorX = false;
+        bool anchorY = false;
+        bool cropLeft = false;
+        bool cropRight = false;
+        bool cropTop = false;
+        bool cropBottom = false;
+        bool maskCenterX = false;
+        bool maskCenterY = false;
+        bool maskWidth = false;
+        bool maskHeight = false;
+        bool maskFeather = false;
+    } mixed;
+    if (multiple) {
+        for (const core::ClipId id : clipIds) {
+            const core::Clip* candidate = editSession_.sequence().findClip(id);
+            if (candidate == nullptr || candidate == primary) continue;
+            const core::MotionKeyframe candidateMotion =
+                motionAt(*candidate, localFrameFor(*candidate));
+            mixed.opacity |= differs(candidateMotion.opacity, primaryMotion.opacity);
+            mixed.gain |= differs(gainAt(*candidate, localFrameFor(*candidate)),
+                                  gainAt(*primary, localFrameFor(*primary)));
+            mixed.rate |= differs(candidate->playbackRate, primary->playbackRate);
+            mixed.fadeIn |= candidate->fadeInFrames != primary->fadeInFrames;
+            mixed.fadeOut |= candidate->fadeOutFrames != primary->fadeOutFrames;
+            mixed.positionX |= differs(candidateMotion.positionX, primaryMotion.positionX);
+            mixed.positionY |= differs(candidateMotion.positionY, primaryMotion.positionY);
+            mixed.scaleX |= differs(candidateMotion.scaleX, primaryMotion.scaleX);
+            mixed.scaleY |= differs(candidateMotion.scaleY, primaryMotion.scaleY);
+            mixed.rotation |=
+                differs(candidateMotion.rotationDegrees, primaryMotion.rotationDegrees);
+            mixed.anchorX |= differs(candidateMotion.anchorX, primaryMotion.anchorX);
+            mixed.anchorY |= differs(candidateMotion.anchorY, primaryMotion.anchorY);
+            mixed.cropLeft |= differs(candidate->cropLeft, primary->cropLeft);
+            mixed.cropRight |= differs(candidate->cropRight, primary->cropRight);
+            mixed.cropTop |= differs(candidate->cropTop, primary->cropTop);
+            mixed.cropBottom |= differs(candidate->cropBottom, primary->cropBottom);
+            mixed.maskCenterX |= differs(candidate->maskCenterX, primary->maskCenterX);
+            mixed.maskCenterY |= differs(candidate->maskCenterY, primary->maskCenterY);
+            mixed.maskWidth |= differs(candidate->maskWidth, primary->maskWidth);
+            mixed.maskHeight |= differs(candidate->maskHeight, primary->maskHeight);
+            mixed.maskFeather |= differs(candidate->maskFeather, primary->maskFeather);
+        }
+    }
+    const auto setMixed = [](QDoubleSpinBox* field, const bool value) {
+        if (auto* mixedField = dynamic_cast<MixedDoubleSpinBox*>(field)) {
+            mixedField->setMixed(value);
+        }
+    };
+    setMixed(opacitySpin_, mixed.opacity);
+    setMixed(gainSpin_, mixed.gain);
+    setMixed(rateSpin_, mixed.rate);
+    setMixed(fadeInSpin_, mixed.fadeIn);
+    setMixed(fadeOutSpin_, mixed.fadeOut);
+    setMixed(positionXSpin_, mixed.positionX);
+    setMixed(positionYSpin_, mixed.positionY);
+    setMixed(scaleXSpin_, mixed.scaleX);
+    setMixed(scaleYSpin_, mixed.scaleY);
+    setMixed(rotationSpin_, mixed.rotation);
+    setMixed(anchorXSpin_, mixed.anchorX);
+    setMixed(anchorYSpin_, mixed.anchorY);
+    setMixed(cropLeftSpin_, mixed.cropLeft);
+    setMixed(cropRightSpin_, mixed.cropRight);
+    setMixed(cropTopSpin_, mixed.cropTop);
+    setMixed(cropBottomSpin_, mixed.cropBottom);
+    setMixed(maskCenterXSpin_, mixed.maskCenterX);
+    setMixed(maskCenterYSpin_, mixed.maskCenterY);
+    setMixed(maskWidthSpin_, mixed.maskWidth);
+    setMixed(maskHeightSpin_, mixed.maskHeight);
+    setMixed(maskFeatherSpin_, mixed.maskFeather);
+    const bool video = hasVideo;
+    const bool showAudio = hasAudio || static_cast<bool>(primary->linkId);
+    if (compositingSection_ != nullptr) compositingSection_->setVisible(video);
+    if (transformSection_ != nullptr) transformSection_->setVisible(video);
+    if (cropMaskSection_ != nullptr) cropMaskSection_->setVisible(video);
+    if (timingSection_ != nullptr) timingSection_->setVisible(true);
+    if (audioSection_ != nullptr) audioSection_->setVisible(showAudio);
+    if (textSection_ != nullptr) textSection_->setVisible(allTitles);
+    if (effectsSection_ != nullptr) effectsSection_->setVisible(!multiple || commonEffects);
+    if (addEffectSection_ != nullptr) addEffectSection_->setVisible(!multiple);
+    for (PropertySection* section :
+         {compositingSection_, audioSection_, timingSection_, transformSection_,
+          cropMaskSection_, effectsSection_}) {
+        if (section != nullptr) {
+            section->setSummary(multiple ? tr("Multiple selection") : QString{});
+        }
+    }
+    const QString multipleTip =
+        multiple
+            ? tr("Multiple selection: editing this field applies it to every compatible "
+                 "selected clip. The primary clip's value is shown.")
+            : QString{};
+    for (QWidget* field :
+         {static_cast<QWidget*>(opacitySpin_), static_cast<QWidget*>(gainSpin_),
+          static_cast<QWidget*>(rateSpin_), static_cast<QWidget*>(fadeInSpin_),
+          static_cast<QWidget*>(fadeOutSpin_), static_cast<QWidget*>(positionXSpin_),
+          static_cast<QWidget*>(positionYSpin_), static_cast<QWidget*>(scaleXSpin_),
+          static_cast<QWidget*>(scaleYSpin_), static_cast<QWidget*>(rotationSpin_),
+          static_cast<QWidget*>(anchorXSpin_), static_cast<QWidget*>(anchorYSpin_),
+          static_cast<QWidget*>(cropLeftSpin_), static_cast<QWidget*>(cropRightSpin_),
+          static_cast<QWidget*>(cropTopSpin_), static_cast<QWidget*>(cropBottomSpin_),
+          static_cast<QWidget*>(maskCenterXSpin_), static_cast<QWidget*>(maskCenterYSpin_),
+          static_cast<QWidget*>(maskWidthSpin_), static_cast<QWidget*>(maskHeightSpin_),
+          static_cast<QWidget*>(maskFeatherSpin_)}) {
+        if (field == nullptr) continue;
+        field->setProperty("multipleSelection", multiple);
+        field->setToolTip(multipleTip);
+        field->style()->unpolish(field);
+        field->style()->polish(field);
+    }
 }
 
 void MainWindow::updateInspector(const core::ClipId clipId) {
@@ -8437,6 +9032,19 @@ void MainWindow::updateInspector(const core::ClipId clipId) {
         updateMonitorEditTarget();
         return;
     }
+    // Selection/playhead synchronization is a model-to-view update. Blocking
+    // the numeric controls here prevents seven transform previews and four
+    // crop previews from firing while the form is populated.
+    std::vector<QSignalBlocker> inspectorBlockers;
+    inspectorBlockers.reserve(21);
+    for (QDoubleSpinBox* spin :
+         {opacitySpin_, gainSpin_, rateSpin_, fadeInSpin_, fadeOutSpin_,
+          positionXSpin_, positionYSpin_, scaleXSpin_, scaleYSpin_, rotationSpin_,
+          anchorXSpin_, anchorYSpin_, cropLeftSpin_, cropRightSpin_, cropTopSpin_,
+          cropBottomSpin_, maskCenterXSpin_, maskCenterYSpin_, maskWidthSpin_,
+          maskHeightSpin_, maskFeatherSpin_}) {
+        inspectorBlockers.emplace_back(spin);
+    }
     const core::Frame localFrame = timeline_ == nullptr ? 0 : std::clamp<core::Frame>(
         timeline_->playheadFrame() - clip->timeline.start, 0, clip->timeline.duration - 1);
     const core::MotionKeyframe motion = motionAt(*clip, localFrame);
@@ -8457,19 +9065,37 @@ void MainWindow::updateInspector(const core::ClipId clipId) {
     if (motionInterpolationCombo_ != nullptr) {
         const auto exact = std::ranges::find(clip->motionKeyframes, localFrame,
                                               &core::MotionKeyframe::frameOffset);
+        const QSignalBlocker blocker(motionInterpolationCombo_);
+        motionInterpolationCombo_->setEnabled(exact != clip->motionKeyframes.end());
         if (exact != clip->motionKeyframes.end()) {
-            const QSignalBlocker blocker(motionInterpolationCombo_);
             motionInterpolationCombo_->setCurrentIndex(
                 motionInterpolationCombo_->findData(static_cast<int>(exact->interpolation)));
+        } else {
+            motionInterpolationCombo_->setCurrentIndex(0);
         }
     }
     if (gainInterpolationCombo_ != nullptr) {
         const auto exact = std::ranges::find(clip->gainKeyframes, localFrame,
                                              &core::GainKeyframe::frameOffset);
+        const QSignalBlocker blocker(gainInterpolationCombo_);
+        gainInterpolationCombo_->setEnabled(exact != clip->gainKeyframes.end());
         if (exact != clip->gainKeyframes.end()) {
-            const QSignalBlocker blocker(gainInterpolationCombo_);
             gainInterpolationCombo_->setCurrentIndex(
                 gainInterpolationCombo_->findData(static_cast<int>(exact->interpolation)));
+        } else {
+            gainInterpolationCombo_->setCurrentIndex(0);
+        }
+    }
+    if (speedInterpolationCombo_ != nullptr) {
+        const auto exact = std::ranges::find(clip->speedKeyframes, localFrame,
+                                             &core::SpeedKeyframe::frameOffset);
+        const QSignalBlocker blocker(speedInterpolationCombo_);
+        speedInterpolationCombo_->setEnabled(exact != clip->speedKeyframes.end());
+        if (exact != clip->speedKeyframes.end()) {
+            speedInterpolationCombo_->setCurrentIndex(
+                speedInterpolationCombo_->findData(static_cast<int>(exact->interpolation)));
+        } else {
+            speedInterpolationCombo_->setCurrentIndex(0);
         }
     }
     cropLeftSpin_->setValue(clip->cropLeft * 100.0);
@@ -8489,6 +9115,64 @@ void MainWindow::updateInspector(const core::ClipId clipId) {
     {
         const QSignalBlocker invertedBlocker(maskInvertedCheck_);
         maskInvertedCheck_->setChecked(clip->maskInverted);
+    }
+    const auto markModified = [](QWidget* widget, const bool modified) {
+        if (widget == nullptr || widget->property("modified").toBool() == modified) return;
+        widget->setProperty("modified", modified);
+        widget->style()->unpolish(widget);
+        widget->style()->polish(widget);
+    };
+    markModified(opacitySpin_, motion.opacity != 1.0 || !clip->motionKeyframes.empty());
+    markModified(gainSpin_, gainAt(*clip, localFrame) != 0.0 ||
+                                !clip->gainKeyframes.empty());
+    markModified(rateSpin_, clip->playbackRate != 1.0 || !clip->speedKeyframes.empty());
+    markModified(fadeInSpin_, clip->fadeInFrames != 0);
+    markModified(fadeOutSpin_, clip->fadeOutFrames != 0);
+    for (QWidget* widget :
+         {static_cast<QWidget*>(positionXSpin_), static_cast<QWidget*>(positionYSpin_),
+          static_cast<QWidget*>(scaleXSpin_), static_cast<QWidget*>(scaleYSpin_),
+          static_cast<QWidget*>(rotationSpin_), static_cast<QWidget*>(anchorXSpin_),
+          static_cast<QWidget*>(anchorYSpin_)}) {
+        markModified(widget, motion.positionX != 0.0 || motion.positionY != 0.0 ||
+                                 motion.scaleX != 1.0 || motion.scaleY != 1.0 ||
+                                 motion.rotationDegrees != 0.0 || motion.anchorX != 0.5 ||
+                                 motion.anchorY != 0.5 || !clip->motionKeyframes.empty());
+    }
+    for (QWidget* widget :
+         {static_cast<QWidget*>(cropLeftSpin_), static_cast<QWidget*>(cropRightSpin_),
+          static_cast<QWidget*>(cropTopSpin_), static_cast<QWidget*>(cropBottomSpin_)}) {
+        markModified(widget, clip->cropLeft != 0.0 || clip->cropRight != 0.0 ||
+                                 clip->cropTop != 0.0 || clip->cropBottom != 0.0);
+    }
+    markModified(maskShapeCombo_, clip->maskShape != core::MaskShape::None);
+    markModified(maskInvertedCheck_, clip->maskInverted);
+    if (compositingSection_ != nullptr) {
+        compositingSection_->setSummary(
+            tr("%1% · fades %2/%3")
+                .arg(qRound(motion.opacity * 100.0))
+                .arg(clip->fadeInFrames)
+                .arg(clip->fadeOutFrames));
+    }
+    if (transformSection_ != nullptr) {
+        transformSection_->setSummary(
+            tr("%1, %2 · %3%")
+                .arg(qRound(motion.positionX))
+                .arg(qRound(motion.positionY))
+                .arg(qRound(motion.scaleX * 100.0)));
+    }
+    if (audioSection_ != nullptr) {
+        audioSection_->setSummary(tr("%1 dB").arg(gainAt(*clip, localFrame), 0, 'f', 1));
+    }
+    if (timingSection_ != nullptr) {
+        timingSection_->setSummary(tr("%1×").arg(clip->playbackRate, 0, 'f', 2));
+    }
+    if (cropMaskSection_ != nullptr) {
+        cropMaskSection_->setSummary(
+            clip->maskShape == core::MaskShape::None &&
+                    clip->cropLeft == 0.0 && clip->cropRight == 0.0 &&
+                    clip->cropTop == 0.0 && clip->cropBottom == 0.0
+                ? tr("Off")
+                : tr("Active"));
     }
     updateEffectsPanel();
     updateTextPanel();
@@ -8564,23 +9248,19 @@ bool MainWindow::previewCacheValid() const {
 }
 
 void MainWindow::toggleMonitorFullscreen() {
-    if (programMonitor_ == nullptr || monitorTabs_ == nullptr) {
+    if (programMonitor_ == nullptr || monitorSplitter_ == nullptr) {
         return;
     }
     if (monitorFullscreen_) {
         programMonitor_->removeEventFilter(this);
         programMonitor_->setFullscreenMode(false);
         programMonitor_->setParent(nullptr);
-        monitorTabs_->insertTab(0, programMonitor_, tr("Program"));
-        monitorTabs_->setCurrentWidget(programMonitor_);
+        monitorSplitter_->insertWidget(1, programMonitor_);
+        monitorSplitter_->setSizes({600, 840});
         programMonitor_->show();
         monitorFullscreen_ = false;
         statusBar()->showMessage(tr("Exited fullscreen preview"), 2000);
     } else {
-        const int index = monitorTabs_->indexOf(programMonitor_);
-        if (index >= 0) {
-            monitorTabs_->removeTab(index);
-        }
         programMonitor_->setParent(nullptr);
         // Fullscreen on the screen the cursor is on (multi-monitor).
         if (QScreen* screen = QGuiApplication::screenAt(QCursor::pos());
@@ -8638,90 +9318,220 @@ void MainWindow::applyInspectorProperties() {
     const double maskHeight = maskHeightSpin_->value() / 100.0;
     const double maskFeather = maskFeatherSpin_->value() / 100.0;
     const bool maskInverted = maskInvertedCheck_->isChecked();
-    const core::Frame selectedLocal = timeline_ == nullptr ? 0 : std::clamp<core::Frame>(
-        timeline_->playheadFrame() - selected->timeline.start, 0,
-        selected->timeline.duration - 1);
-    const core::MotionKeyframe selectedMotion = motionAt(*selected, selectedLocal);
-    const double selectedGain = gainAt(*selected, selectedLocal);
-    const bool playheadInsideSelected = timeline_ != nullptr &&
-                                        selected->timeline.contains(timeline_->playheadFrame());
-    const bool motionChanged = selectedMotion.opacity != opacity ||
-                               selectedMotion.positionX != positionX ||
-                               selectedMotion.positionY != positionY ||
-                               selectedMotion.scaleX != scaleX ||
-                               selectedMotion.scaleY != scaleY ||
-                               selectedMotion.rotationDegrees != rotation ||
-                               selectedMotion.anchorX != anchorX ||
-                               selectedMotion.anchorY != anchorY;
-    if (!playheadInsideSelected &&
-        ((!selected->gainKeyframes.empty() && selectedGain != gain) ||
-         (!selected->motionKeyframes.empty() && motionChanged))) {
-        statusBar()->showMessage(tr("Move the playhead inside the clip to edit automation"),
-                                 3000);
-        updateInspector(selected->id);
-        return;
+
+    QWidget* source = inspectorEditSource_;
+    const QString sourceGroup =
+        source == nullptr ? QString{} : source->property("inspectorGroup").toString();
+    const bool editAll = source == nullptr;
+    const bool editOpacity = editAll || source == opacitySpin_;
+    const bool editGain = editAll || source == gainSpin_;
+    const bool editRate = editAll || source == rateSpin_;
+    const bool editFadeIn = editAll || source == fadeInSpin_;
+    const bool editFadeOut = editAll || source == fadeOutSpin_;
+    const bool editTransform =
+        editAll || sourceGroup == QStringLiteral("transform") ||
+        source == positionXSpin_ || source == positionYSpin_ || source == scaleXSpin_ ||
+        source == scaleYSpin_ || source == rotationSpin_ || source == anchorXSpin_ ||
+        source == anchorYSpin_;
+    const bool editCrop =
+        editAll || sourceGroup == QStringLiteral("crop") || source == cropLeftSpin_ ||
+        source == cropRightSpin_ || source == cropTopSpin_ || source == cropBottomSpin_;
+    const bool editMask =
+        editAll || sourceGroup == QStringLiteral("mask") || source == maskShapeCombo_ ||
+        source == maskCenterXSpin_ || source == maskCenterYSpin_ ||
+        source == maskWidthSpin_ || source == maskHeightSpin_ ||
+        source == maskFeatherSpin_ || source == maskInvertedCheck_;
+
+    QSet<qulonglong> selectedIds;
+    if (timeline_ != nullptr) {
+        for (const core::ClipId id : timeline_->selectedClipIds()) {
+            selectedIds.insert(id.value);
+        }
     }
-    if (selectedMotion.opacity == opacity && selectedGain == gain &&
-        selected->playbackRate == rate && selected->fadeInFrames == fadeIn &&
-        selected->fadeOutFrames == fadeOut && selectedMotion.positionX == positionX &&
-        selectedMotion.positionY == positionY && selectedMotion.scaleX == scaleX &&
-        selectedMotion.scaleY == scaleY && selectedMotion.rotationDegrees == rotation &&
-        selectedMotion.anchorX == anchorX && selectedMotion.anchorY == anchorY &&
-        selected->cropLeft == cropLeft && selected->cropRight == cropRight &&
-        selected->cropTop == cropTop && selected->cropBottom == cropBottom &&
-        selected->maskShape == maskShape && selected->maskCenterX == maskCenterX &&
-        selected->maskCenterY == maskCenterY && selected->maskWidth == maskWidth &&
-        selected->maskHeight == maskHeight && selected->maskFeather == maskFeather &&
-        selected->maskInverted == maskInverted) {
-        return;
-    }
+    selectedIds.insert(selected->id.value);
+
     std::vector<core::EditCommand> commands;
     for (const core::Track& track : editSession_.sequence().tracks()) {
         for (const core::Clip& clip : track.clips) {
-            if (clip.id == selected->id || (selected->linkId && clip.linkId == selected->linkId)) {
-                const bool animatedMotion = track.kind == core::TrackKind::Video &&
-                                            !clip.motionKeyframes.empty();
-                const bool animatedGain = track.kind == core::TrackKind::Audio &&
-                                          !clip.gainKeyframes.empty();
-                commands.push_back(core::SetClipPropertiesCommand{
-                    .clipId = clip.id,
-                    .opacity = animatedMotion ? clip.opacity : opacity,
-                    .audioGainDb = animatedGain ? clip.audioGainDb : gain,
-                    .playbackRate = rate,
-                });
-                if (animatedGain && timeline_ != nullptr &&
-                    clip.timeline.contains(timeline_->playheadFrame())) {
-                    const core::Frame local = timeline_->playheadFrame() -
-                                              clip.timeline.start;
+            const bool selectedDirectly = selectedIds.contains(clip.id.value);
+            const bool linkedToPrimary =
+                selected->linkId && clip.linkId == selected->linkId;
+            if (selectedDirectly || linkedToPrimary) {
+                const bool video = track.kind == core::TrackKind::Video;
+                const bool audio = track.kind == core::TrackKind::Audio;
+                const bool animatedMotion = video && !clip.motionKeyframes.empty();
+                const bool animatedGain = audio && !clip.gainKeyframes.empty();
+                const bool playheadInside =
+                    timeline_ != nullptr &&
+                    clip.timeline.contains(timeline_->playheadFrame());
+                if (((editOpacity || editTransform) && animatedMotion ||
+                     editGain && animatedGain) &&
+                    !playheadInside) {
+                    statusBar()->showMessage(
+                        tr("Move the playhead inside every animated clip in the selection"),
+                        3000);
+                    updateInspector(selected->id);
+                    return;
+                }
+                const core::Frame local = timeline_ == nullptr
+                                              ? 0
+                                              : std::clamp<core::Frame>(
+                                                    timeline_->playheadFrame() -
+                                                        clip.timeline.start,
+                                                    0, clip.timeline.duration - 1);
+                const core::MotionKeyframe currentMotion = motionAt(clip, local);
+
+                if (editOpacity || editGain || editRate) {
+                    const double targetOpacity =
+                        video && editOpacity && !animatedMotion ? opacity : clip.opacity;
+                    const double targetGain =
+                        audio && editGain && !animatedGain ? gain : clip.audioGainDb;
+                    const double targetRate = editRate ? rate : clip.playbackRate;
+                    commands.push_back(core::SetClipPropertiesCommand{
+                        .clipId = clip.id,
+                        .opacity = targetOpacity,
+                        .audioGainDb = targetGain,
+                        .playbackRate = targetRate,
+                    });
+                }
+                if (animatedGain && editGain) {
                     commands.push_back(core::SetGainKeyframeCommand{
                         clip.id, local, gain,
                         static_cast<core::KeyframeInterpolation>(
                             gainInterpolationCombo_->currentData().toInt())});
                 }
-                commands.push_back(core::SetClipFadesCommand{clip.id, fadeIn, fadeOut});
-                if (track.kind == core::TrackKind::Video) {
-                    if (animatedMotion && timeline_ != nullptr &&
-                        clip.timeline.contains(timeline_->playheadFrame())) {
-                        const core::Frame local = timeline_->playheadFrame() -
-                                                  clip.timeline.start;
-                        commands.push_back(core::SetMotionKeyframeCommand{
-                            clip.id, local, opacity, positionX, positionY, scaleX, scaleY,
-                            rotation, anchorX, anchorY,
-                            static_cast<core::KeyframeInterpolation>(
-                                motionInterpolationCombo_->currentData().toInt())});
-                    } else if (!animatedMotion) {
-                        commands.push_back(core::SetClipTransformCommand{
-                            clip.id, positionX, positionY, scaleX, scaleY, rotation, anchorX,
-                            anchorY});
-                    }
+                if (editFadeIn || editFadeOut) {
+                    commands.push_back(core::SetClipFadesCommand{
+                        clip.id, editFadeIn ? fadeIn : clip.fadeInFrames,
+                        editFadeOut ? fadeOut : clip.fadeOutFrames});
+                }
+                if (!video) {
+                    continue;
+                }
+                if (animatedMotion && (editOpacity || editTransform)) {
+                    commands.push_back(core::SetMotionKeyframeCommand{
+                        clip.id,
+                        local,
+                        editOpacity ? opacity : currentMotion.opacity,
+                        editTransform && (sourceGroup == QStringLiteral("transform") ||
+                                          source == positionXSpin_ || editAll)
+                            ? positionX
+                            : currentMotion.positionX,
+                        editTransform && (sourceGroup == QStringLiteral("transform") ||
+                                          source == positionYSpin_ || editAll)
+                            ? positionY
+                            : currentMotion.positionY,
+                        editTransform && (sourceGroup == QStringLiteral("transform") ||
+                                          source == scaleXSpin_ || editAll)
+                            ? scaleX
+                            : currentMotion.scaleX,
+                        editTransform && (sourceGroup == QStringLiteral("transform") ||
+                                          source == scaleYSpin_ || editAll)
+                            ? scaleY
+                            : currentMotion.scaleY,
+                        editTransform && (sourceGroup == QStringLiteral("transform") ||
+                                          source == rotationSpin_ || editAll)
+                            ? rotation
+                            : currentMotion.rotationDegrees,
+                        editTransform && (sourceGroup == QStringLiteral("transform") ||
+                                          source == anchorXSpin_ || editAll)
+                            ? anchorX
+                            : currentMotion.anchorX,
+                        editTransform && (sourceGroup == QStringLiteral("transform") ||
+                                          source == anchorYSpin_ || editAll)
+                            ? anchorY
+                            : currentMotion.anchorY,
+                        static_cast<core::KeyframeInterpolation>(
+                            motionInterpolationCombo_->currentData().toInt())});
+                } else if (editTransform) {
+                    commands.push_back(core::SetClipTransformCommand{
+                        clip.id,
+                        sourceGroup == QStringLiteral("transform") ||
+                                source == positionXSpin_ || editAll
+                            ? positionX
+                            : clip.positionX,
+                        sourceGroup == QStringLiteral("transform") ||
+                                source == positionYSpin_ || editAll
+                            ? positionY
+                            : clip.positionY,
+                        sourceGroup == QStringLiteral("transform") ||
+                                source == scaleXSpin_ || editAll
+                            ? scaleX
+                            : clip.scaleX,
+                        sourceGroup == QStringLiteral("transform") ||
+                                source == scaleYSpin_ || editAll
+                            ? scaleY
+                            : clip.scaleY,
+                        sourceGroup == QStringLiteral("transform") ||
+                                source == rotationSpin_ || editAll
+                            ? rotation
+                            : clip.rotationDegrees,
+                        sourceGroup == QStringLiteral("transform") ||
+                                source == anchorXSpin_ || editAll
+                            ? anchorX
+                            : clip.anchorX,
+                        sourceGroup == QStringLiteral("transform") ||
+                                source == anchorYSpin_ || editAll
+                            ? anchorY
+                            : clip.anchorY});
+                }
+                if (editCrop) {
                     commands.push_back(core::SetClipCropCommand{
-                        clip.id, cropLeft, cropRight, cropTop, cropBottom});
+                        clip.id,
+                        sourceGroup == QStringLiteral("crop") ||
+                                source == cropLeftSpin_ || editAll
+                            ? cropLeft
+                            : clip.cropLeft,
+                        sourceGroup == QStringLiteral("crop") ||
+                                source == cropRightSpin_ || editAll
+                            ? cropRight
+                            : clip.cropRight,
+                        sourceGroup == QStringLiteral("crop") ||
+                                source == cropTopSpin_ || editAll
+                            ? cropTop
+                            : clip.cropTop,
+                        sourceGroup == QStringLiteral("crop") ||
+                                source == cropBottomSpin_ || editAll
+                            ? cropBottom
+                            : clip.cropBottom});
+                }
+                if (editMask) {
                     commands.push_back(core::SetClipMaskCommand{
-                        clip.id, maskShape, maskCenterX, maskCenterY, maskWidth, maskHeight,
-                        maskFeather, maskInverted});
+                        clip.id,
+                        sourceGroup == QStringLiteral("mask") ||
+                                source == maskShapeCombo_ || editAll
+                            ? maskShape
+                            : clip.maskShape,
+                        sourceGroup == QStringLiteral("mask") ||
+                                source == maskCenterXSpin_ || editAll
+                            ? maskCenterX
+                            : clip.maskCenterX,
+                        sourceGroup == QStringLiteral("mask") ||
+                                source == maskCenterYSpin_ || editAll
+                            ? maskCenterY
+                            : clip.maskCenterY,
+                        sourceGroup == QStringLiteral("mask") ||
+                                source == maskWidthSpin_ || editAll
+                            ? maskWidth
+                            : clip.maskWidth,
+                        sourceGroup == QStringLiteral("mask") ||
+                                source == maskHeightSpin_ || editAll
+                            ? maskHeight
+                            : clip.maskHeight,
+                        sourceGroup == QStringLiteral("mask") ||
+                                source == maskFeatherSpin_ || editAll
+                            ? maskFeather
+                            : clip.maskFeather,
+                        sourceGroup == QStringLiteral("mask") ||
+                                source == maskInvertedCheck_ || editAll
+                            ? maskInverted
+                            : clip.maskInverted});
                 }
             }
         }
+    }
+    if (commands.empty()) {
+        return;
     }
     const core::EditResult result = editSession_.apply(core::TransactionEnvelope{
         .baseRevision = editSession_.sequence().revision(),
@@ -8745,25 +9555,65 @@ void MainWindow::updateEffectsPanel() {
         effectEnabledCheck_ == nullptr || effectInterpolationCombo_ == nullptr) {
         return;
     }
-    const qulonglong previousId = effectsList_->currentItem() == nullptr
-                                      ? 0
-                                      : effectsList_->currentItem()
-                                            ->data(Qt::UserRole)
-                                            .toULongLong();
-    const QSignalBlocker listBlocker(effectsList_);
-    effectsList_->clear();
     const core::Clip* clip = editSession_.sequence().findClip(inspectedClip_);
     if (clip == nullptr) {
+        if (effectsPanelClip_ || effectsList_->count() > 0) {
+            const QSignalBlocker listBlocker(effectsList_);
+            effectsList_->clear();
+        }
+        effectsPanelClip_ = {};
+        effectsPanelSignature_.clear();
         effectAmountSpin_->setEnabled(false);
         effectEnabledCheck_->setEnabled(false);
         effectInterpolationCombo_->setEnabled(false);
+        effectInterpolationCombo_->setCurrentIndex(0);
         if (keyframeLanesWidget_ != nullptr) {
             static_cast<KeyframeLaneWidget*>(keyframeLanesWidget_)
                 ->setLanes({}, 0, 1, 0);
         }
         return;
     }
-    if (keyframeLanesWidget_ != nullptr) {
+
+    QByteArray signatureSource;
+    const auto appendKey = [&signatureSource](const auto& key) {
+        signatureSource += QByteArray::number(static_cast<qlonglong>(key.frameOffset));
+        signatureSource += ':';
+        signatureSource += QByteArray::number(static_cast<int>(key.interpolation));
+        signatureSource += ';';
+    };
+    signatureSource += QByteArray::number(static_cast<qulonglong>(clip->id.value));
+    signatureSource += '|';
+    for (const core::MotionKeyframe& key : clip->motionKeyframes) appendKey(key);
+    signatureSource += '|';
+    for (const core::GainKeyframe& key : clip->gainKeyframes) appendKey(key);
+    signatureSource += '|';
+    for (const core::SpeedKeyframe& key : clip->speedKeyframes) appendKey(key);
+    signatureSource += '|';
+    for (const core::ClipEffect& effect : clip->effects) {
+        signatureSource += QByteArray::number(static_cast<qulonglong>(effect.id.value));
+        signatureSource += ':';
+        signatureSource += QByteArray::number(static_cast<int>(effect.type));
+        signatureSource += effect.enabled ? ":1:" : ":0:";
+        for (const core::EffectKeyframe& key : effect.keyframes) appendKey(key);
+        signatureSource += '|';
+    }
+    const QByteArray signature =
+        QCryptographicHash::hash(signatureSource, QCryptographicHash::Sha256);
+    const bool modelChanged =
+        effectsPanelClip_ != clip->id || effectsPanelSignature_ != signature;
+    const core::Frame playhead = timeline_ == nullptr ? 0 : timeline_->playheadFrame();
+    if (effectsSection_ != nullptr) {
+        const qsizetype animatedCount =
+            std::ranges::count_if(clip->effects, [](const core::ClipEffect& effect) {
+                return !effect.keyframes.empty();
+            });
+        effectsSection_->setSummary(
+            tr("%1 effects · %2 animated")
+                .arg(static_cast<qulonglong>(clip->effects.size()))
+                .arg(animatedCount));
+    }
+
+    if (modelChanged && keyframeLanesWidget_ != nullptr) {
         std::vector<KeyframeLaneEntry> lanes;
         if (!clip->motionKeyframes.empty()) {
             KeyframeLaneEntry lane{.name = tr("Motion"), .laneType = 0};
@@ -8804,25 +9654,204 @@ void MainWindow::updateEffectsPanel() {
         }
         static_cast<KeyframeLaneWidget*>(keyframeLanesWidget_)
             ->setLanes(std::move(lanes), clip->timeline.start, clip->timeline.duration,
-                       timeline_ == nullptr ? 0 : timeline_->playheadFrame());
+                       playhead);
+    } else if (keyframeLanesWidget_ != nullptr) {
+        static_cast<KeyframeLaneWidget*>(keyframeLanesWidget_)->setPlayhead(playhead);
     }
-    QListWidgetItem* selectedItem = nullptr;
-    for (const core::ClipEffect& effect : clip->effects) {
-        auto* item = new QListWidgetItem(
-            tr("%1  %2  [%3 keyframes]")
-                .arg(effect.enabled ? QStringLiteral("✓") : QStringLiteral("○"),
-                     effectName(effect.type))
-                .arg(effect.keyframes.size()),
-            effectsList_);
-        item->setData(Qt::UserRole, QVariant::fromValue<qulonglong>(effect.id.value));
-        if (effect.id.value == previousId) {
-            selectedItem = item;
+
+    QListWidgetItem* selectedItem = effectsList_->currentItem();
+    if (modelChanged) {
+        const qulonglong previousId = selectedItem == nullptr
+                                          ? 0
+                                          : selectedItem->data(Qt::UserRole).toULongLong();
+        const QSignalBlocker listBlocker(effectsList_);
+        effectsList_->clear();
+        selectedItem = nullptr;
+        for (const core::ClipEffect& effect : clip->effects) {
+            auto* item = new QListWidgetItem(effectsList_);
+            item->setData(Qt::UserRole, QVariant::fromValue<qulonglong>(effect.id.value));
+            item->setSizeHint(QSize(0, 116));
+            auto* card = new EffectCard(effectsList_);
+            const core::EffectId effectId = effect.id;
+            card->setHandlers(
+                [this, effectId](const bool effectEnabled, const double amount) {
+                    const core::EditResult result = editSession_.apply({
+                        .baseRevision = editSession_.sequence().revision(),
+                        .label = "Change effect",
+                        .command = core::SetEffectCommand{
+                            inspectedClip_, effectId, effectEnabled, amount},
+                    });
+                    if (result.succeeded()) {
+                        setDirty(true);
+                        QTimer::singleShot(0, this, [this] {
+                            refreshEditor();
+                            updateProgramFrame(timeline_->playheadFrame());
+                        });
+                    }
+                },
+                [this, effectId] {
+                    const core::EditResult result = editSession_.apply({
+                        .baseRevision = editSession_.sequence().revision(),
+                        .label = "Remove effect",
+                        .command = core::RemoveEffectCommand{inspectedClip_, effectId},
+                    });
+                    if (result.succeeded()) {
+                        setDirty(true);
+                        QTimer::singleShot(0, this, [this] {
+                            refreshEditor();
+                            updateProgramFrame(timeline_->playheadFrame());
+                        });
+                    }
+                },
+                [this, effectId](const bool add) {
+                    const core::Clip* selected =
+                        editSession_.sequence().findClip(inspectedClip_);
+                    if (selected == nullptr || timeline_ == nullptr ||
+                        !selected->timeline.contains(timeline_->playheadFrame())) {
+                        statusBar()->showMessage(
+                            tr("Move the playhead inside the clip first"), 3000);
+                        return;
+                    }
+                    const auto selectedEffect =
+                        std::ranges::find(selected->effects, effectId,
+                                          &core::ClipEffect::id);
+                    if (selectedEffect == selected->effects.end()) return;
+                    const core::Frame offset =
+                        timeline_->playheadFrame() - selected->timeline.start;
+                    const auto existing =
+                        std::ranges::find(selectedEffect->keyframes, offset,
+                                          &core::EffectKeyframe::frameOffset);
+                    const bool shouldAdd = add || existing == selectedEffect->keyframes.end();
+                    const core::EditResult result = editSession_.apply({
+                        .baseRevision = editSession_.sequence().revision(),
+                        .label = shouldAdd ? "Set effect keyframe"
+                                          : "Remove effect keyframe",
+                        .command =
+                            shouldAdd
+                                ? core::EditCommand{core::SetEffectKeyframeCommand{
+                                      selected->id, effectId, offset,
+                                      effectValueAt(*selectedEffect, offset),
+                                      core::KeyframeInterpolation::Linear}}
+                                : core::EditCommand{core::RemoveEffectKeyframeCommand{
+                                      selected->id, effectId, offset}},
+                    });
+                    if (result.succeeded()) {
+                        setDirty(true);
+                        QTimer::singleShot(0, this, [this] {
+                            refreshEditor();
+                            updateProgramFrame(timeline_->playheadFrame());
+                        });
+                    }
+                },
+                [this, effectId] {
+                    const core::Clip* selected =
+                        editSession_.sequence().findClip(inspectedClip_);
+                    if (selected == nullptr || timeline_ == nullptr) return;
+                    const auto selectedEffect =
+                        std::ranges::find(selected->effects, effectId,
+                                          &core::ClipEffect::id);
+                    if (selectedEffect == selected->effects.end()) return;
+                    const core::Frame local =
+                        timeline_->playheadFrame() - selected->timeline.start;
+                    core::Frame target = -1;
+                    for (const core::EffectKeyframe& key : selectedEffect->keyframes) {
+                        if (key.frameOffset < local) target = key.frameOffset;
+                    }
+                    if (target >= 0) timeline_->setPlayheadFrame(selected->timeline.start + target);
+                },
+                [this, effectId] {
+                    const core::Clip* selected =
+                        editSession_.sequence().findClip(inspectedClip_);
+                    if (selected == nullptr || timeline_ == nullptr) return;
+                    const auto selectedEffect =
+                        std::ranges::find(selected->effects, effectId,
+                                          &core::ClipEffect::id);
+                    if (selectedEffect == selected->effects.end()) return;
+                    const core::Frame local =
+                        timeline_->playheadFrame() - selected->timeline.start;
+                    const auto next = std::ranges::find_if(
+                        selectedEffect->keyframes,
+                        [local](const core::EffectKeyframe& key) {
+                            return key.frameOffset > local;
+                        });
+                    if (next != selectedEffect->keyframes.end()) {
+                        timeline_->setPlayheadFrame(selected->timeline.start +
+                                                    next->frameOffset);
+                    }
+                },
+                [this, effectId](const core::KeyframeInterpolation interpolation) {
+                    const core::Clip* selected =
+                        editSession_.sequence().findClip(inspectedClip_);
+                    if (selected == nullptr || timeline_ == nullptr) return;
+                    const auto selectedEffect =
+                        std::ranges::find(selected->effects, effectId,
+                                          &core::ClipEffect::id);
+                    if (selectedEffect == selected->effects.end()) return;
+                    const core::Frame offset =
+                        timeline_->playheadFrame() - selected->timeline.start;
+                    const auto key =
+                        std::ranges::find(selectedEffect->keyframes, offset,
+                                          &core::EffectKeyframe::frameOffset);
+                    if (key == selectedEffect->keyframes.end()) return;
+                    const core::EditResult result = editSession_.apply({
+                        .baseRevision = editSession_.sequence().revision(),
+                        .label = "Change keyframe interpolation",
+                        .command = core::SetEffectKeyframeCommand{
+                            selected->id, effectId, offset, key->value, interpolation},
+                    });
+                    if (result.succeeded()) {
+                        setDirty(true);
+                        QTimer::singleShot(0, this, [this] {
+                            refreshEditor();
+                            updateProgramFrame(timeline_->playheadFrame());
+                        });
+                    }
+                });
+            effectsList_->setItemWidget(item, card);
+            if (effect.id.value == previousId) {
+                selectedItem = item;
+            }
         }
+        if (selectedItem == nullptr && effectsList_->count() > 0) {
+            selectedItem = effectsList_->item(0);
+        }
+        effectsList_->setCurrentItem(selectedItem);
+        effectsPanelClip_ = clip->id;
+        effectsPanelSignature_ = signature;
     }
-    if (selectedItem == nullptr && effectsList_->count() > 0) {
-        selectedItem = effectsList_->item(0);
+
+    const core::Frame localFrame = timeline_ == nullptr
+                                       ? 0
+                                       : timeline_->playheadFrame() - clip->timeline.start;
+    for (int row = 0; row < effectsList_->count(); ++row) {
+        QListWidgetItem* item = effectsList_->item(row);
+        auto* card = qobject_cast<EffectCard*>(effectsList_->itemWidget(item));
+        if (item == nullptr || card == nullptr) continue;
+        const core::EffectId effectId{item->data(Qt::UserRole).toULongLong()};
+        const auto effect =
+            std::ranges::find(clip->effects, effectId, &core::ClipEffect::id);
+        if (effect == clip->effects.end()) continue;
+        EffectCardState state{.id = effect->id,
+                              .type = effect->type,
+                              .name = effectName(effect->type),
+                              .enabled = effect->enabled,
+                              .amount = effectValueAt(*effect, localFrame),
+                              .animated = !effect->keyframes.empty()};
+        const EffectParameterDescriptor descriptor =
+            effectParameterDescriptor(effect->type);
+        state.parameterName = descriptor.name;
+        state.suffix = descriptor.suffix;
+        state.minimum = descriptor.minimum;
+        state.maximum = descriptor.maximum;
+        const auto keyframe = std::ranges::find(
+            effect->keyframes, localFrame, &core::EffectKeyframe::frameOffset);
+        if (keyframe != effect->keyframes.end()) {
+            state.keyAtPlayhead = true;
+            state.interpolation = keyframe->interpolation;
+        }
+        card->setState(state);
     }
-    effectsList_->setCurrentItem(selectedItem);
+
     const bool enabled = selectedItem != nullptr;
     effectAmountSpin_->setEnabled(enabled);
     effectEnabledCheck_->setEnabled(enabled);
@@ -8852,16 +9881,15 @@ void MainWindow::updateEffectsPanel() {
         effectAmountSpin_->setRange(0.0, 50.0);
         break;
     }
-    const core::Frame localFrame = timeline_ == nullptr
-                                       ? 0
-                                       : timeline_->playheadFrame() - clip->timeline.start;
     effectAmountSpin_->setValue(effectValueAt(*effect, localFrame));
     const auto keyframe = std::ranges::find(effect->keyframes, localFrame,
                                              &core::EffectKeyframe::frameOffset);
+    const QSignalBlocker interpolationBlocker(effectInterpolationCombo_);
     if (keyframe != effect->keyframes.end()) {
-        const QSignalBlocker interpolationBlocker(effectInterpolationCombo_);
         effectInterpolationCombo_->setCurrentIndex(effectInterpolationCombo_->findData(
             static_cast<int>(keyframe->interpolation)));
+    } else {
+        effectInterpolationCombo_->setCurrentIndex(0);
     }
 }
 
